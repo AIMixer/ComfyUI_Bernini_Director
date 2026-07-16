@@ -1,0 +1,80 @@
+"""Per-segment helpers shared by the Director executor."""
+
+from __future__ import annotations
+
+import base64
+import io
+
+import torch
+from PIL import Image
+
+from ..lib.image_prep import fit_canvas, fit_video_long_edge
+from ..lib.video_io import load_timeline_segment
+from .frame_align import pad_or_trim_frames
+from .plan import DirectorPlan
+
+
+def needs_source_video(task_key: str) -> bool:
+    return task_key in {"v2v", "rv2v", "vi2v", "vrc2v", "mv2v", "ads2v", "i2v", "i2i"}
+
+
+def is_gen_timeline_plan(plan: DirectorPlan) -> bool:
+    mode = str((plan.raw or {}).get("timelineMode") or "").lower()
+    return mode in ("gen_blank", "gen_image", "prompt_batch", "image_batch")
+
+
+def resolve_segment_raw_clip(plan: DirectorPlan, seg) -> torch.Tensor:
+    """Prefer in-memory gen canvas / segment clip; fall back to timeline video decode."""
+    if seg.source_clip is not None and seg.source_clip.shape[0] > 0:
+        return seg.source_clip.clone()
+
+    sv = plan.source_video
+    if is_gen_timeline_plan(plan) and sv is not None and int(sv.shape[0]) > 0:
+        start = max(0, int(seg.start_frame))
+        end = min(int(seg.end_frame), int(sv.shape[0]))
+        if end > start:
+            return sv[start:end].clone()
+
+    return load_timeline_segment(plan.raw, seg.start_frame, seg.end_frame)
+
+
+def source_passthrough_chunk(plan: DirectorPlan, seg) -> torch.Tensor:
+    """Scaled source frames for skipped v2v segments with no generation cache yet."""
+    raw_clip = resolve_segment_raw_clip(plan, seg)
+    target_len = raw_clip.shape[0]
+    if plan.output_mode == "fixed":
+        clip = fit_canvas(raw_clip, plan.width, plan.height)
+    else:
+        clip = fit_video_long_edge(raw_clip, plan.ref_max_size)
+    return pad_or_trim_frames(clip, target_len).cpu().float()
+
+
+def segment_passthrough_chunk(plan: DirectorPlan, seg) -> torch.Tensor | None:
+    """Best-effort fill for skipped segments (gen source clip, then timeline video)."""
+    if seg.source_clip is not None and seg.source_clip.shape[0] > 0:
+        target_len = max(1, seg.frame_count or int(seg.source_clip.shape[0]))
+        clip = seg.source_clip.clone()
+        if clip.shape[0] > target_len:
+            clip = clip[:target_len]
+        elif clip.shape[0] < target_len:
+            pad = clip[-1:].repeat(target_len - clip.shape[0], 1, 1, 1)
+            clip = torch.cat([clip, pad], dim=0)
+        return clip.cpu().float()
+    if needs_source_video(seg.task_key):
+        try:
+            return source_passthrough_chunk(plan, seg)
+        except Exception:
+            return None
+    return None
+
+
+def tensor_frame_to_jpeg_b64(frame: torch.Tensor) -> str:
+    arr = (frame.detach().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
+    img = Image.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def frames_label(seg) -> str:
+    return f"帧 {seg.start_frame}–{seg.end_frame} ({seg.frame_count}f)"

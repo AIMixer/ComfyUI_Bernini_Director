@@ -1,0 +1,2 @@
+# Runtime deps are provided by ComfyUI. Optional:
+# opencv-python  # faster video probe/decode fallbacks if cv2 is desired

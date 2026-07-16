@@ -1,0 +1,14 @@
+[project]
+name = "ComfyUI_Bernini_Director"
+description = "Multi-segment Bernini Director — ComfyUI native BerniniConditioning only."
+version = "1.0.0"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/AIMixer/ComfyUI_Bernini_Director"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI Bernini Director"
+Icon = ""
