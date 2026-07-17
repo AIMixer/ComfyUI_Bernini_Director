@@ -56,9 +56,6 @@ def segment_passthrough_chunk(plan: DirectorPlan, seg) -> torch.Tensor | None:
         clip = seg.source_clip.clone()
         if clip.shape[0] > target_len:
             clip = clip[:target_len]
-        elif clip.shape[0] < target_len:
-            pad = clip[-1:].repeat(target_len - clip.shape[0], 1, 1, 1)
-            clip = torch.cat([clip, pad], dim=0)
         return clip.cpu().float()
     if needs_source_video(seg.task_key):
         try:

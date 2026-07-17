@@ -44,6 +44,14 @@ def sample_dual_stage(
         "enable",
     )
 
+    # Prefix lock only needed on the high-noise stage. Carrying noise_mask into the
+    # low stage (leftover-noise handoff) can leave salt-pepper / snowflake artifacts
+    # on Bernini dual-stage Wan sampling.
+    latent_low_in = latent_high
+    if isinstance(latent_high, dict) and "noise_mask" in latent_high:
+        latent_low_in = dict(latent_high)
+        latent_low_in.pop("noise_mask", None)
+
     latent_low, = sampler.sample(
         model_low,
         "disable",
@@ -54,7 +62,7 @@ def sample_dual_stage(
         scheduler,
         positive,
         negative,
-        latent_high,
+        latent_low_in,
         split_step,
         int(steps),
         "disable",

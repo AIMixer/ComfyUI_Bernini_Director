@@ -1,24 +1,25 @@
-"""Cross-segment continuity — **opt-in branch only**.
+"""Cross-segment continuity — **opt-in official Bernini path only**.
 
-When continuity is **off**, the director must follow the official Studio /
-per-segment path: each segment's own source + user refs → BerniniConditioning
-→ dual-stage KSampler → VAEDecode. No prev-tail injection, no post luma.
+When continuity is **off**: Studio / per-segment path — segment source + user refs
+→ BerniniConditioning → KSamplerAdvanced → VAEDecode. No cross-segment injection.
 
-When continuity is **on**, this module's branch runs instead and may:
-1. Prefix ``source_video`` with luma-normalized prev-tail
-2. Optionally inject at most one prev-tail frame as ``reference_image_*``
-   (skipped when the segment already has user reference images)
-3. After decode, trim overlap prefix and re-anchor mean luminance to source
+When continuity is **on** (WanSCAIL-style handoff on the official Bernini stack):
+1. Prepend prev-tail pixels to ``source_video`` so canvas length matches generation
+2. Generate ``prefix + segment`` frames, trim prefix after decode
+3. SCAIL latent prefix lock via ``noise_mask`` (prefix not resampled)
+4. Append **one** appearance ref frame to ``context_latents``
+5. Do **not** inject a second full motion stream (that duplicated / shifted
+   source_id channels and caused seam jumps + temporal stutter)
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 
-from ..lib.image_prep import cat_frames_variable_size, fit_canvas
-from ..lib.ref_images import MAX_REFERENCE_IMAGES, REF_IMAGE_KEY_PREFIX
+from ..lib.image_prep import cat_frames_variable_size, fit_canvas, fit_long_edge
 from .plan import DirectorPlan, SegmentPlan, wan_align_frame_count
 from .segment_cache import load_segment_cache
 
@@ -29,13 +30,7 @@ CONTINUITY_TASK_KEYS = frozenset({"v2v", "rv2v", "vi2v", "vrc2v", "mv2v", "ads2v
 DEFAULT_CONTINUITY_OVERLAP = 9
 MIN_CONTINUITY_OVERLAP = 1
 MAX_CONTINUITY_OVERLAP = 81
-# At most one generated continuity ref — multi-ref from prev output drifts face exposure.
 MAX_CONTINUITY_REF_FRAMES = 1
-# Source-stream anchor: replace opening frames of source_video with prev output.
-MAX_CONTINUITY_SOURCE_ANCHOR = 17
-# Post-decode: pull whole segment mean luma toward source (stops cumulative face brighten).
-SEGMENT_SOURCE_LUMA_STRENGTH = 0.55
-SEGMENT_SOURCE_LUMA_MAX_DELTA = 0.18
 
 
 def resolve_continuity_settings(timeline: dict, *, segment_count: int) -> tuple[bool, int]:
@@ -59,26 +54,15 @@ def resolve_continuity_settings(timeline: dict, *, segment_count: int) -> tuple[
 
 
 def resolve_continuity_lock_pixels(overlap_frames: int) -> int:
-    """Wan-aligned frames taken from prev tail (shared budget for refs + source anchor)."""
+    """SCAIL prefix length in pixels (Wan 4n+1, for clean VAE round-trip)."""
     ov = max(MIN_CONTINUITY_OVERLAP, min(MAX_CONTINUITY_OVERLAP, int(overlap_frames)))
     return wan_align_frame_count(ov)
-
-
-def resolve_continuity_ref_frames(overlap_frames: int) -> int:
-    """How many prev-tail frames to inject as reference_image_*."""
-    return min(resolve_continuity_lock_pixels(overlap_frames), MAX_CONTINUITY_REF_FRAMES)
-
-
-def resolve_continuity_source_anchor_frames(overlap_frames: int) -> int:
-    """How many opening source frames to hard-replace with prev output."""
-    return min(resolve_continuity_lock_pixels(overlap_frames), MAX_CONTINUITY_SOURCE_ANCHOR)
 
 
 def resolve_continuity_guide_frames(overlap_frames: int) -> tuple[int, int, int, int, int]:
     """Map UI overlap → (context_px, tail_refs, seam_blend, opening_blend, color_match)."""
     lock = resolve_continuity_lock_pixels(overlap_frames)
-    refs = resolve_continuity_ref_frames(overlap_frames)
-    # Post seam soft-blend / opening color-match disabled (drift). Whole-segment luma used instead.
+    refs = min(MAX_CONTINUITY_REF_FRAMES, max(1, lock))
     return lock, refs, 0, 0, 0
 
 
@@ -89,165 +73,23 @@ def resolve_segment_generation_frames(
     continuity_enabled: bool,
     continuity_overlap: int,
 ) -> tuple[int, int]:
-    """Return (gen_frames, prefix_trim_after_decode).
-
-    Continuity segments generate overlap extra frames (prev-tail conditioned),
-    then drop that prefix so the export does not repeat the previous ending.
-    """
-    base = wan_align_frame_count(max(1, int(segment_frame_count)))
+    """Return (gen_frames, prefix_trim_after_decode)."""
+    body = max(1, int(segment_frame_count))
     if not continuity_enabled or segment_index <= 0:
-        return base, 0
-    lock_px = resolve_continuity_source_anchor_frames(continuity_overlap)
+        return wan_align_frame_count(body), 0
+    lock_px = resolve_continuity_lock_pixels(continuity_overlap)
     if lock_px <= 0:
-        return base, 0
-    return wan_align_frame_count(base + lock_px), lock_px
+        return wan_align_frame_count(body), 0
+    # Prepended source is lock + body; Wan length must be 4n+1.
+    return wan_align_frame_count(lock_px + body), lock_px
 
 
 def is_continuity_active(plan: DirectorPlan, seg: SegmentPlan) -> bool:
-    """True only on the opt-in continuity branch for segment index > 0."""
     return (
         plan.continuity_enabled
         and plan.segment_count >= 2
         and seg.index > 0
         and seg.task_key in CONTINUITY_TASK_KEYS
-    )
-
-
-def apply_continuity_conditioning_branch(
-    *,
-    plan: DirectorPlan,
-    seg: SegmentPlan,
-    all_segments: list[SegmentPlan],
-    completed_outputs: dict[int, torch.Tensor],
-    node_id: str | None,
-    source_arg: torch.Tensor | None,
-    ref_kwargs: dict[str, torch.Tensor],
-    num_frames: int,
-    target_len: int,
-    ctx_w: int,
-    ctx_h: int,
-) -> tuple[torch.Tensor | None, dict[str, torch.Tensor], int, int, str | None]:
-    """Opt-in branch: inject prev-tail into conditioning.
-
-    Returns ``(source_for_cond, cond_refs, num_frames, prefix_trim, note)``.
-    Callers must only invoke this when ``plan.continuity_enabled`` is True.
-    If the segment is not eligible (first segment / wrong task), returns the
-    official inputs unchanged (source_arg, ref_kwargs, num_frames, 0, None).
-    """
-    if not plan.continuity_enabled:
-        return source_arg, dict(ref_kwargs), int(num_frames), 0, None
-
-    prev_tail = resolve_prev_segment_output(
-        plan, all_segments, seg.index, completed_outputs, node_id
-    )
-    if not is_continuity_active(plan, seg) or prev_tail is None:
-        return source_arg, dict(ref_kwargs), int(num_frames), 0, None
-
-    from ..lib.image_prep import cat_frames_variable_size
-
-    anchor_n = resolve_continuity_source_anchor_frames(plan.continuity_overlap_frames)
-    anchor_n = min(anchor_n, int(prev_tail.shape[0]))
-    anchored = 0
-    prefix_trim = 0
-    out_frames = int(num_frames)
-    source_for_cond = source_arg
-    cond_refs = dict(ref_kwargs)
-
-    guide_tail = prev_tail
-    if source_arg is not None and int(source_arg.shape[0]) > 0:
-        guide_tail = normalize_guide_luma_to_source(
-            prev_tail,
-            source_arg[0],
-            width=ctx_w,
-            height=ctx_h,
-        )
-
-    if source_arg is not None and anchor_n > 0:
-        tail = fit_canvas(guide_tail[-anchor_n:], ctx_w, ctx_h).to(
-            device=source_arg.device, dtype=source_arg.dtype
-        )
-        source_for_cond = cat_frames_variable_size([tail, source_arg])
-        if int(source_for_cond.shape[0]) > out_frames:
-            source_for_cond = source_for_cond[:out_frames]
-        elif int(source_for_cond.shape[0]) < out_frames:
-            pad = source_for_cond[-1:].repeat(
-                out_frames - int(source_for_cond.shape[0]), 1, 1, 1
-            )
-            source_for_cond = torch.cat([source_for_cond, pad], dim=0)
-        anchored = anchor_n
-        prefix_trim = anchor_n
-    elif anchor_n > 0:
-        prefix_trim = 0
-        out_frames = wan_align_frame_count(max(1, int(target_len)))
-
-    ref_n = min(
-        resolve_continuity_ref_frames(plan.continuity_overlap_frames),
-        int(guide_tail.shape[0]),
-    )
-    cond_refs, added = continuity_ref_kwargs_from_prev(
-        ref_kwargs,
-        guide_tail,
-        width=ctx_w,
-        height=ctx_h,
-        n_frames=ref_n,
-        window_frames=anchor_n if anchor_n > 0 else ref_n,
-    )
-
-    bits = []
-    if anchored > 0:
-        bits.append(f"source-prefix {anchored}f")
-    if added > 0:
-        bits.append(f"+{added} ref")
-    note = None
-    if bits:
-        note = (
-            f"  continuity branch seg #{seg.index + 1}: "
-            + ", ".join(bits)
-            + (f", trim {prefix_trim}f" if prefix_trim > 0 else "")
-            + f" (overlap {plan.continuity_overlap_frames})"
-        )
-    return source_for_cond, cond_refs, out_frames, prefix_trim, note
-
-
-def apply_continuity_post_decode_branch(
-    decoded: torch.Tensor,
-    *,
-    plan: DirectorPlan,
-    seg: SegmentPlan,
-    source_arg: torch.Tensor | None,
-    ref_kwargs: dict[str, torch.Tensor],
-    prefix_trim: int,
-    target_len: int,
-    ctx_w: int,
-    ctx_h: int,
-) -> torch.Tensor:
-    """Opt-in branch: trim overlap prefix + optional source luma re-anchor.
-
-    When continuity is off, callers must not use this — only pad/trim to
-    ``target_len`` like the official Studio path.
-    """
-    out = decoded
-    if prefix_trim > 0 and out.shape[0] > prefix_trim:
-        out = out[prefix_trim:]
-    if out.shape[0] > target_len:
-        out = out[:target_len]
-    elif out.shape[0] < target_len and out.shape[0] > 0:
-        pad = out[-1:].repeat(target_len - out.shape[0], 1, 1, 1)
-        out = torch.cat([out, pad], dim=0)
-
-    if not plan.continuity_enabled or seg.index <= 0 or source_arg is None:
-        return out
-
-    user_ref_slots = sum(1 for k in ref_kwargs if k.startswith(REF_IMAGE_KEY_PREFIX))
-    luma_strength = 0.28 if user_ref_slots > 0 else 0.55
-    luma_delta = 0.10 if user_ref_slots > 0 else 0.18
-    return match_segment_luminance_to_source(
-        out,
-        source_arg,
-        width=ctx_w,
-        height=ctx_h,
-        strength=luma_strength,
-        max_ratio_delta=luma_delta,
     )
 
 
@@ -276,165 +118,269 @@ def resolve_prev_segment_output(
     )
 
 
-def _occupied_ref_slots(ref_kwargs: dict[str, torch.Tensor]) -> set[int]:
-    occupied: set[int] = set()
-    for key in ref_kwargs:
-        if key.startswith(REF_IMAGE_KEY_PREFIX):
-            occupied.add(int(key.removeprefix(REF_IMAGE_KEY_PREFIX)))
-    return occupied
-
-
-def apply_source_continuity_anchor(
-    source_video: torch.Tensor | None,
-    prev_output: torch.Tensor,
+def prepend_continuity_source(
+    clip_frames: torch.Tensor,
+    prev_output: torch.Tensor | None,
     *,
+    lock_px: int,
     width: int,
     height: int,
-    n_frames: int,
-) -> tuple[torch.Tensor | None, int]:
-    """Hard-replace opening of source_video with prev-tail (Bernini source stream)."""
-    if source_video is None or int(n_frames) <= 0:
-        return source_video, 0
-    n = min(int(n_frames), int(source_video.shape[0]), int(prev_output.shape[0]))
-    if n <= 0:
-        return source_video, 0
-    out = source_video.clone()
-    tail = fit_canvas(prev_output[-n:], width, height).to(device=out.device, dtype=out.dtype)
-    out[:n] = tail
-    log.info("Segment continuity: anchored %d source opening frame(s) from prev tail", n)
-    return out, n
+) -> torch.Tensor:
+    """Prepend prev-tail so Bernini source canvas aligns with SCAIL-locked prefix.
 
-
-def continuity_ref_kwargs_from_prev(
-    ref_kwargs: dict[str, torch.Tensor],
-    prev_output: torch.Tensor,
-    *,
-    width: int,
-    height: int,
-    n_frames: int,
-    window_frames: int | None = None,
-) -> tuple[dict[str, torch.Tensor], int]:
-    """Append at most one prev-tail frame into a free reference_image_* slot.
-
-    Skipped entirely when the segment already has user reference images — those
-    own appearance; injecting generated frames there is the main face-brighten path.
+    Without this, generation length is extended but source stays segment-only →
+    temporal misalignment → hard seams / pose resets at segment boundaries.
     """
-    occupied = _occupied_ref_slots(ref_kwargs)
-    if occupied:
-        log.info(
-            "Segment continuity: skip continuity refs (%d user ref slot(s) present)",
-            len(occupied),
+    if prev_output is None or lock_px <= 0 or int(clip_frames.shape[0]) <= 0:
+        return clip_frames
+    n = min(int(lock_px), int(prev_output.shape[0]))
+    if n <= 0:
+        return clip_frames
+    prefix = fit_canvas(prev_output[-n:], width, height)
+    body = fit_canvas(clip_frames, width, height)
+    prefix = prefix.to(device=body.device, dtype=body.dtype)
+    out = torch.cat([prefix, body], dim=0)
+    log.info(
+        "Segment continuity: prepended %d source frame(s) from prev tail (%d body)",
+        n,
+        int(body.shape[0]),
+    )
+    return out
+
+
+def _normalize_context_latent_5d(latent: torch.Tensor) -> torch.Tensor:
+    """Match official BerniniConditioning: keep VAE encode as ``[1, C, F, H, W]``."""
+    if latent.ndim == 3:
+        latent = latent.unsqueeze(0).unsqueeze(2)
+    elif latent.ndim == 4:
+        latent = latent.unsqueeze(0)
+    if latent.ndim != 5:
+        raise ValueError(
+            f"Context latent must be 5D [1,C,F,H,W] (got {tuple(latent.shape)})"
         )
-        return dict(ref_kwargs), 0
-
-    n = min(int(n_frames), int(prev_output.shape[0]), MAX_CONTINUITY_REF_FRAMES)
-    if n <= 0:
-        return dict(ref_kwargs), 0
-
-    free_slots = [i for i in range(MAX_REFERENCE_IMAGES) if i not in occupied]
-    if not free_slots:
-        return dict(ref_kwargs), 0
-
-    n = min(n, len(free_slots))
-    window = int(window_frames) if window_frames is not None else n
-    window = min(max(n, window), int(prev_output.shape[0]))
-    tail_window = fit_canvas(prev_output[-window:], width, height)
-
-    # Prefer the last frame (seam).
-    picks = [int(tail_window.shape[0]) - 1]
-
-    merged = dict(ref_kwargs)
-    for i, frame_i in enumerate(picks):
-        slot = free_slots[i]
-        merged[f"{REF_IMAGE_KEY_PREFIX}{slot}"] = tail_window[frame_i : frame_i + 1].contiguous()
-    log.info("Segment continuity: injected %d Bernini reference_image stream(s)", len(picks))
-    return merged, len(picks)
+    if int(latent.shape[0]) != 1:
+        raise ValueError(f"Context latent batch must be 1, got {tuple(latent.shape)}")
+    return latent
 
 
-def _frame_mean_luminance(frame: torch.Tensor) -> float:
-    """Mean Rec.601 luma for an HWC tensor in [0, 1]."""
-    f = frame.float()
-    luma = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
-    return float(luma.mean().item())
+def _latent_frame_count(pixel_frames: int) -> int:
+    return max(1, (max(1, int(pixel_frames)) - 1) // 4 + 1)
 
 
-def _tensor_mean_luminance(frames: torch.Tensor) -> float:
-    """Mean Rec.601 luma over a frame batch (N,H,W,C) or single frame."""
-    f = frames.float()
-    if f.dim() == 3:
-        f = f.unsqueeze(0)
-    luma = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
-    return float(luma.mean().item())
+def _encode_video_latent(vae, frames: torch.Tensor) -> torch.Tensor:
+    """Encode [F,H,W,C] frames with ComfyUI native VAE → 5D [1,C,F,H,W]."""
+    lat = vae.encode(frames[..., :3])
+    return _normalize_context_latent_5d(lat)
 
 
-def normalize_guide_luma_to_source(
-    guide: torch.Tensor,
-    source_frame: torch.Tensor,
+def _encode_reference_latent(vae, frame: torch.Tensor, ref_max_size: int) -> torch.Tensor:
+    """Encode a single reference frame (long-edge resize) with native VAE."""
+    resized = fit_long_edge(frame[..., :3], int(ref_max_size))
+    lat = vae.encode(resized)
+    return _normalize_context_latent_5d(lat)
+
+
+def encode_tail_clip(
+    tail_clip: torch.Tensor,
     *,
+    vae,
     width: int,
     height: int,
 ) -> torch.Tensor:
-    """Fully match guide batch mean luma to a source frame (pre-conditioning)."""
-    if guide is None or int(guide.shape[0]) <= 0:
-        return guide
-    ref = source_frame
-    if ref.dim() == 4:
-        ref = ref[0]
-    ref = fit_canvas(ref.unsqueeze(0), width, height)[0]
-    out = fit_canvas(guide, width, height).float()
-    ref_mean = max(_frame_mean_luminance(ref), 1e-6)
-    guide_mean = max(_tensor_mean_luminance(out), 1e-6)
-    ratio = ref_mean / guide_mean
-    # Cap extreme ratios (flash / near-black) but allow real exposure correction.
-    ratio = max(0.55, min(1.8, ratio))
-    if abs(ratio - 1.0) < 0.01:
-        return out.to(dtype=guide.dtype)
-    log.info(
-        "Segment continuity: normalize guide luma ×%.3f (guide=%.3f → source=%.3f)",
-        ratio,
-        guide_mean,
-        ref_mean,
+    """VAE-encode prev-tail clip for SCAIL lock (must already be Wan 4n+1 length)."""
+    clip = fit_canvas(tail_clip, width, height)
+    aligned = wan_align_frame_count(int(clip.shape[0]))
+    if int(clip.shape[0]) > aligned:
+        clip = clip[:aligned]
+    elif int(clip.shape[0]) < aligned:
+        # Prefer mirror from existing motion over freezing last frame.
+        need = aligned - int(clip.shape[0])
+        pad = clip[: min(need, int(clip.shape[0]))].flip(0)
+        while int(pad.shape[0]) < need:
+            pad = torch.cat([pad, clip.flip(0)], dim=0)
+        clip = torch.cat([clip, pad[:need]], dim=0)
+    return _encode_video_latent(vae, clip)
+
+
+def apply_scail_prefix_to_latent(
+    latent: dict[str, Any],
+    tail_latent: torch.Tensor,
+    overlap_pixel_frames: int,
+) -> dict[str, Any]:
+    """Write prev-tail prefix into latent + noise_mask=0 (official KSampler path)."""
+    tail_latent = _normalize_context_latent_5d(tail_latent)
+    samples = latent["samples"]
+    if samples.ndim == 4:
+        samples = samples.unsqueeze(0)
+    _, _c, t_total, h, w = samples.shape
+    if int(tail_latent.shape[3]) != h or int(tail_latent.shape[4]) != w:
+        log.warning(
+            "Segment continuity: skip SCAIL prefix — spatial mismatch "
+            "tail %dx%d vs latent %dx%d",
+            int(tail_latent.shape[3]),
+            int(tail_latent.shape[4]),
+            h,
+            w,
+        )
+        return latent
+    aligned_pixels = wan_align_frame_count(int(overlap_pixel_frames))
+    t_tail = min(
+        int(tail_latent.shape[2]),
+        _latent_frame_count(aligned_pixels),
+        t_total,
     )
-    return (out * ratio).clamp(0.0, 1.0).to(dtype=guide.dtype)
+    if t_tail <= 0:
+        return latent
+
+    out = dict(latent)
+    patched = samples.clone()
+    patched[:, :, :t_tail] = tail_latent[:, :, :t_tail].to(
+        device=patched.device, dtype=patched.dtype
+    )
+    noise_mask = torch.ones(
+        (1, 1, t_total, h, w),
+        dtype=patched.dtype,
+        device=patched.device,
+    )
+    noise_mask[:, :, :t_tail] = 0.0
+    out["samples"] = patched
+    out["noise_mask"] = noise_mask
+    log.info(
+        "Segment continuity: SCAIL prefix lock %d latent frame(s) (%d px)",
+        t_tail,
+        aligned_pixels,
+    )
+    return out
 
 
-def match_segment_luminance_to_source(
+def _context_latents_from_conditioning(conditioning) -> list[torch.Tensor]:
+    for _tensor, payload in conditioning or []:
+        if isinstance(payload, dict):
+            streams = payload.get("context_latents")
+            if streams:
+                return list(streams)
+    return []
+
+
+def append_tail_reference_latent(
+    streams: list[torch.Tensor],
+    prev_output: torch.Tensor,
+    *,
+    vae,
+    width: int,
+    height: int,
+    ref_max_size: int,
+) -> list[torch.Tensor]:
+    """Append last prev frame as one reference-image latent (appearance only)."""
+    if int(prev_output.shape[0]) <= 0:
+        return streams
+    frame = fit_canvas(prev_output[-1:], width, height)
+    lat = _encode_reference_latent(vae, frame, ref_max_size)
+    log.info("Segment continuity: appended 1 appearance reference latent")
+    return list(streams) + [lat]
+
+
+def apply_continuity_to_core_conditioning(
+    positive,
+    negative,
+    *,
+    prev_output: torch.Tensor,
+    vae,
+    width: int,
+    height: int,
+    ref_max_size: int,
+    n_ref_frames: int = 1,
+):
+    """Append appearance ref only — motion handoff lives in prepended source + SCAIL."""
+    import node_helpers
+
+    if int(n_ref_frames) <= 0:
+        return positive, negative
+    streams = _context_latents_from_conditioning(positive)
+    streams = append_tail_reference_latent(
+        streams,
+        prev_output,
+        vae=vae,
+        width=width,
+        height=height,
+        ref_max_size=ref_max_size,
+    )
+    payload = {"context_latents": streams}
+    positive = node_helpers.conditioning_set_values(positive, payload)
+    negative = node_helpers.conditioning_set_values(negative, payload)
+    return positive, negative
+
+
+def apply_scail_continuity_core(
+    *,
+    plan: DirectorPlan,
+    seg: SegmentPlan,
+    prev_output: torch.Tensor | None,
+    positive,
+    negative,
+    vae,
+    width: int,
+    height: int,
+    ref_max_size: int = 848,
+    latent: dict[str, Any] | None = None,
+) -> tuple[Any, Any, dict[str, Any] | None, str | None]:
+    """SCAIL latent prefix + one appearance ref. Source prepend happens in executor."""
+    if not is_continuity_active(plan, seg) or prev_output is None:
+        return positive, negative, latent, None
+
+    lock_px = min(
+        resolve_continuity_lock_pixels(plan.continuity_overlap_frames),
+        int(prev_output.shape[0]),
+    )
+    if lock_px <= 0:
+        return positive, negative, latent, None
+
+    _, ref_frames, _, _, _ = resolve_continuity_guide_frames(plan.continuity_overlap_frames)
+
+    tail_clip = fit_canvas(prev_output[-lock_px:], width, height)
+    tail_latent = encode_tail_clip(
+        tail_clip,
+        vae=vae,
+        width=width,
+        height=height,
+    )
+    positive, negative = apply_continuity_to_core_conditioning(
+        positive,
+        negative,
+        prev_output=prev_output,
+        vae=vae,
+        width=width,
+        height=height,
+        ref_max_size=ref_max_size,
+        n_ref_frames=ref_frames,
+    )
+    if latent is not None:
+        latent = apply_scail_prefix_to_latent(latent, tail_latent, lock_px)
+
+    t_lock = _latent_frame_count(wan_align_frame_count(lock_px))
+    note = (
+        f"  continuity branch seg #{seg.index + 1}: source-prepend + SCAIL lock "
+        f"{lock_px}f ({t_lock} latent) + {ref_frames}f ref "
+        f"(overlap {plan.continuity_overlap_frames})"
+    )
+    return positive, negative, latent, note
+
+
+def trim_decoded_for_continuity(
     decoded: torch.Tensor,
-    source_video: torch.Tensor | None,
     *,
-    width: int,
-    height: int,
-    strength: float = SEGMENT_SOURCE_LUMA_STRENGTH,
-    max_ratio_delta: float = SEGMENT_SOURCE_LUMA_MAX_DELTA,
+    prefix_trim: int,
+    target_len: int,
 ) -> torch.Tensor:
-    """Uniform RGB scale so decoded mean luma tracks the source clip (whole segment)."""
-    if (
-        source_video is None
-        or int(decoded.shape[0]) <= 0
-        or int(source_video.shape[0]) <= 0
-        or strength <= 0.0
-    ):
-        return decoded
-    src = fit_canvas(source_video, width, height)
-    n = min(int(decoded.shape[0]), int(src.shape[0]))
-    if n <= 0:
-        return decoded
-    ref_mean = max(_tensor_mean_luminance(src[:n]), 1e-6)
-    dec_mean = max(_tensor_mean_luminance(decoded[:n]), 1e-6)
-    ratio = ref_mean / dec_mean
-    delta = max(0.0, float(max_ratio_delta))
-    ratio = max(1.0 - delta, min(1.0 + delta, ratio))
-    applied = 1.0 + (ratio - 1.0) * max(0.0, min(1.0, float(strength)))
-    if abs(applied - 1.0) < 0.005:
-        return decoded
-    log.info(
-        "Segment continuity: whole-segment luma ×%.3f toward source "
-        "(decoded=%.3f source=%.3f)",
-        applied,
-        dec_mean,
-        ref_mean,
-    )
-    return (decoded.float() * applied).clamp(0.0, 1.0).to(dtype=decoded.dtype)
+    """Drop SCAIL overlap prefix, then cut to target length (no last-frame pad)."""
+    out = decoded
+    if prefix_trim > 0 and out.shape[0] > prefix_trim:
+        out = out[prefix_trim:]
+    elif prefix_trim > 0 and out.shape[0] == prefix_trim:
+        out = out[:0]
+    if target_len > 0 and out.shape[0] > target_len:
+        out = out[:target_len]
+    return out
 
 
 def continuity_merged_frame_count(plan: DirectorPlan) -> int:
@@ -446,7 +392,7 @@ def concat_continuous_chunks(
     segments: list[SegmentPlan],
     plan: DirectorPlan,
 ) -> torch.Tensor:
-    """Concatenate full segments; plain join."""
+    """Concatenate full segments; plain join (no seam crossfade)."""
     if not chunks:
         raise ValueError("concat_continuous_chunks: no chunks")
     if not plan.continuity_enabled or len(chunks) <= 1:

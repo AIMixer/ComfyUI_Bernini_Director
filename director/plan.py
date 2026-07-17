@@ -503,14 +503,17 @@ def slice_video_frames(source: torch.Tensor, start: int, end: int) -> torch.Tens
 
 
 def prepare_segment_clip(clip: torch.Tensor, target_frames: int) -> tuple[torch.Tensor, int]:
+    """Trim source to Wan length. Do **not** pad with last-frame copies.
+
+    Fabricating freeze frames in the source makes Bernini/Wan reproduce visible
+    stutter / duplicate frames. Official BerniniConditioning simply encodes
+    ``source[:length]`` even when the clip is shorter than ``length``.
+    """
     actual = clip.shape[0]
     if actual <= 0:
         raise ValueError("Segment has no frames.")
     num_frames = wan_align_frame_count(max(actual, target_frames))
-    if actual < num_frames:
-        pad = clip[-1:].repeat(num_frames - actual, 1, 1, 1)
-        clip = torch.cat([clip, pad], dim=0)
-    elif actual > num_frames:
+    if actual > num_frames:
         clip = clip[:num_frames]
     return clip, num_frames
 
@@ -584,7 +587,7 @@ def plan_summary(plan: DirectorPlan) -> str:
         lock_px = resolve_continuity_lock_pixels(plan.continuity_overlap_frames)
         lines.append(
             f"Segment continuity: ON (overlap {plan.continuity_overlap_frames} "
-            f"→ {lock_px}f source-prefix branch)"
+            f"→ SCAIL lock {lock_px}f + 1 ref, official path)"
         )
     else:
         lines.append("Segment continuity: OFF (official Studio / per-segment path)")

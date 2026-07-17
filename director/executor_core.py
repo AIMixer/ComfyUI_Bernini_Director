@@ -34,10 +34,12 @@ from .progress import report_director_finish, report_director_progress, report_d
 from .segment_cache import load_segment_cache, save_segment_cache
 from .segment_continuity import (
     apply_cached_segment_continuity,
-    apply_continuity_conditioning_branch,
-    apply_continuity_post_decode_branch,
+    apply_scail_continuity_core,
     concat_continuous_chunks,
+    prepend_continuity_source,
+    resolve_prev_segment_output,
     resolve_segment_generation_frames,
+    trim_decoded_for_continuity,
 )
 from .vram_cleanup import cleanup_segment_vram
 
@@ -94,8 +96,8 @@ def execute_director_plan_core(
     completed_outputs: dict[int, torch.Tensor] = {}
     if plan.continuity_enabled:
         reports.append(
-            "Segment continuity: ON — opt-in branch "
-            "(luma-normalized source-prefix / optional 1 ref / trim / source luma re-anchor)"
+            "Segment continuity: ON — official SCAIL branch "
+            "(latent prefix lock + context motion/ref from prev tail; no pixel prefix / color post)"
         )
     else:
         reports.append(
@@ -130,7 +132,8 @@ def execute_director_plan_core(
             clip_frames = fit_canvas(raw_clip, plan.width, plan.height)
         else:
             clip_frames = fit_video_long_edge(raw_clip, plan.ref_max_size)
-        # Length prep: official Studio = this segment only; continuity may add overlap.
+        # Length prep: official Studio = this segment only; continuity prepends prev-tail.
+        prev_tail_output = None
         if is_one_frame_i2v:
             num_frames = wan_align_frame_count(target_len)
             prefix_trim = 0
@@ -141,8 +144,23 @@ def execute_director_plan_core(
                 continuity_enabled=True,
                 continuity_overlap=plan.continuity_overlap_frames,
             )
-            base_frames = wan_align_frame_count(max(1, int(target_len)))
-            clip_frames, _ = prepare_segment_clip(clip_frames, base_frames)
+            # Keep body at the segment's own length (no last-frame pad).
+            clip_frames, _ = prepare_segment_clip(clip_frames, max(1, int(target_len)))
+            if prefix_trim > 0 and needs_source_video(seg.task_key):
+                prev_tail_output = resolve_prev_segment_output(
+                    plan, all_segments, seg.index, completed_outputs, node_id
+                )
+                if clip_frames is not None and clip_frames.shape[0] > 0:
+                    ctx_h, ctx_w = int(clip_frames.shape[1]), int(clip_frames.shape[2])
+                else:
+                    ctx_w, ctx_h = plan.width, plan.height
+                clip_frames = prepend_continuity_source(
+                    clip_frames,
+                    prev_tail_output,
+                    lock_px=prefix_trim,
+                    width=ctx_w,
+                    height=ctx_h,
+                )
             num_frames = int(gen_frames)
         else:
             # Official Studio / Bernini single-clip path — no overlap padding.
@@ -229,31 +247,8 @@ def execute_director_plan_core(
             **meta,
         )
 
-        # Default = official Studio inputs (this segment only). Continuity is a separate branch.
-        cond_refs = dict(ref_kwargs)
-        source_for_cond = source_arg
-        continuity_note = None
-        if plan.continuity_enabled:
-            (
-                source_for_cond,
-                cond_refs,
-                num_frames,
-                prefix_trim,
-                continuity_note,
-            ) = apply_continuity_conditioning_branch(
-                plan=plan,
-                seg=seg,
-                all_segments=all_segments,
-                completed_outputs=completed_outputs,
-                node_id=node_id,
-                source_arg=source_arg,
-                ref_kwargs=ref_kwargs,
-                num_frames=num_frames,
-                target_len=target_len,
-                ctx_w=ctx_w,
-                ctx_h=ctx_h,
-            )
-
+        # BerniniConditioning on (possibly continuity-prepended) source + user refs.
+        # SCAIL latent lock + appearance ref are applied immediately after.
         positive, negative, latent, task_hint = _run_conditioning(
             positive,
             negative,
@@ -262,13 +257,30 @@ def execute_director_plan_core(
             ctx_h,
             num_frames,
             1,
-            source_video=source_for_cond,
+            source_video=source_arg,
             reference_video=ref_video_arg,
             ref_max_size=plan.ref_max_size,
-            **cond_refs,
+            **ref_kwargs,
         )
-        if continuity_note:
-            reports.append(continuity_note)
+        if plan.continuity_enabled and seg.index > 0:
+            if prev_tail_output is None:
+                prev_tail_output = resolve_prev_segment_output(
+                    plan, all_segments, seg.index, completed_outputs, node_id
+                )
+            positive, negative, latent, continuity_note = apply_scail_continuity_core(
+                plan=plan,
+                seg=seg,
+                prev_output=prev_tail_output,
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                width=ctx_w,
+                height=ctx_h,
+                ref_max_size=plan.ref_max_size,
+                latent=latent,
+            )
+            if continuity_note:
+                reports.append(continuity_note)
         report_director_progress(
             node_id,
             segment_index=progress_index,
@@ -345,26 +357,16 @@ def execute_director_plan_core(
             **meta,
         )
 
+        # Length finalize only — no color/luma post (avoids smile drift / color shift).
         if plan.continuity_enabled:
-            # Continuity branch: trim overlap prefix + optional source luma re-anchor.
-            decoded = apply_continuity_post_decode_branch(
+            decoded = trim_decoded_for_continuity(
                 decoded,
-                plan=plan,
-                seg=seg,
-                source_arg=source_arg,
-                ref_kwargs=ref_kwargs,
                 prefix_trim=prefix_trim,
                 target_len=target_len,
-                ctx_w=ctx_w,
-                ctx_h=ctx_h,
             )
-        else:
-            # Official Studio path: length only — no cross-segment post-process.
-            if decoded.shape[0] > target_len:
-                decoded = decoded[:target_len]
-            elif decoded.shape[0] < target_len and decoded.shape[0] > 0:
-                pad = decoded[-1:].repeat(target_len - decoded.shape[0], 1, 1, 1)
-                decoded = torch.cat([decoded, pad], dim=0)
+        elif decoded.shape[0] > target_len:
+            # Cut only — never pad with repeated last frames (visible stutter).
+            decoded = decoded[:target_len]
 
         chunk = decoded.cpu().float()
         save_segment_cache(node_id, seg, plan, chunk)
