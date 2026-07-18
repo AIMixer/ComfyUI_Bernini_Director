@@ -35,7 +35,10 @@ import {
 import { mountPromptImageMentions } from "./bernini_prompt_mentions.js";
 
 const RULER_H = 24;
+const SEG_LABEL_H = 18;
 const TRACK_H = 160;
+const TRACK_Y = RULER_H + SEG_LABEL_H;
+const STAGE_PREVIEW_H = 220;
 const MIN_SEG = 4;
 const HANDLE_PX = 14;
 const THUMB_MAX_W = 168;
@@ -68,6 +71,12 @@ function stripTimelineContinuityRootFields(timeline) {
     delete timeline.continuity_enabled;
     delete timeline.continuityOverlapFrames;
     delete timeline.continuity_overlap_frames;
+}
+
+/** Drop ephemeral UI-only fields so they never persist in timeline_data. */
+function stripTimelineEphemeralFields(timeline) {
+    if (!timeline || typeof timeline !== "object") return;
+    delete timeline.videoWorkspace;
 }
 
 const HIDDEN_WIDGETS = [
@@ -160,11 +169,24 @@ const STYLES = `
 .bd-modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-shrink:0}
 .bd-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;width:100%}
 .bd-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;flex:1;min-width:0}
+.bd-stage{width:100%;box-sizing:border-box;background:#0c0c0c;border:1px solid #222;border-bottom:none;border-radius:6px 6px 0 0;overflow:hidden;position:relative;min-height:120px;max-height:280px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
+.bd-stage.hidden{display:none!important}
+.bd-stage-video,.bd-stage-img{width:100%;height:100%;max-height:280px;object-fit:contain;background:#000;display:block}
+.bd-stage-img.hidden,.bd-stage-video.hidden{display:none!important}
+.bd-stage-empty{color:#555;font-size:11px;pointer-events:none}
+.bd-stage-badge{position:absolute;left:8px;bottom:8px;padding:2px 7px;border-radius:3px;background:rgba(0,0,0,.65);color:#ccc;font-size:10px;line-height:1.4;cursor:pointer;user-select:none}
+.bd-stage-badge:hover{color:#fff;background:rgba(0,0,0,.8)}
+.bd-frame-jump{display:inline-flex;align-items:center;gap:4px;color:#ddd;font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.bd-frame-jump .bd-frame-input{width:64px;background:#181818;border:1px solid #444;border-radius:4px;color:#eee;padding:4px 4px;font-size:11px;text-align:center;-moz-appearance:textfield}
+.bd-frame-jump .bd-frame-input:focus{border-color:#4fff8f;outline:none}
+.bd-frame-jump .bd-frame-input::-webkit-outer-spin-button,.bd-frame-jump .bd-frame-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.bd-frame-jump .bd-frame-total{color:#888;min-width:2.5em}
+.bd-controls{width:100%;box-sizing:border-box;background:#151515;border:1px solid #222;border-radius:0 0 6px 6px;padding:8px 10px;margin-top:0}
+.bd-stage.hidden+.bd-controls{border-radius:6px;border-color:#333;background:#1e1e1e}
 .bd-viewport{width:100%;min-width:100%;overflow-x:auto;border-radius:6px;border:1px solid #111;background:#2a2a2a;box-sizing:border-box}
 .bd-canvas{display:block;width:100%;min-width:100%;cursor:pointer;box-sizing:border-box}
 .bd-canvas.bd-grab{cursor:grab}
 .bd-canvas.bd-grabbing{cursor:grabbing}
-.bd-controls{width:100%;box-sizing:border-box;background:#1e1e1e;border:1px solid #333;border-radius:6px;padding:6px 10px}
 .bd-output{width:100%;box-sizing:border-box;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 8px;background:#1e1e1e;border:1px solid #333;border-radius:6px}
 .bd-split{display:block;width:100%;box-sizing:border-box}
 .bd-player{display:flex;align-items:center;gap:10px;flex-wrap:wrap;width:100%}
@@ -185,7 +207,8 @@ const STYLES = `
 .bd-mode button.active{background:#333;color:#fff}
 .bd-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .bd-bounds,.bd-timecode{color:#aaa;font-size:11px}
-.bd-timecode{color:#fff;font-weight:600}
+.bd-timecode{color:#fff;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bd-player .bd-timecode{min-width:88px;font-size:11px;color:#ddd}
 .bd-icon-btn{background:#2a2a2a;border:1px solid #444;color:#eee;cursor:pointer;padding:6px 10px;border-radius:4px}
 .bd-icon-btn.active{background:#1a3a2a;color:#4fff8f;border-color:#4fff8f;box-shadow:0 0 0 1px rgba(79,255,143,.35)}
 .bd-seek{flex:1;min-width:120px;height:6px}
@@ -397,6 +420,28 @@ function logicalToSourceFrame(logical, video) {
     return src;
 }
 
+/** Inverse of logicalToSourceFrame for sparse deletes; -1 if source is in a deleted gap. */
+function sourceToLogicalFrame(srcFrame, video) {
+    const map = video?.frameMap;
+    if (map?.length) {
+        let best = -1;
+        for (let i = 0; i < map.length; i++) {
+            const e = normalizeFrameMapEntry(map[i]);
+            if (e.frame === srcFrame) return i;
+            if (e.frame < srcFrame) best = i;
+            else if (best < 0) return -1; // before first kept
+        }
+        return best;
+    }
+    let logical = srcFrame;
+    for (const [start, end] of [...deletedSourceRanges(video)].sort((a, b) => a[0] - b[0])) {
+        if (srcFrame >= end) logical -= (end - start);
+        else if (srcFrame >= start) return -1;
+        else break;
+    }
+    return Math.max(0, logical);
+}
+
 function buildIdentityFrameMap(count) {
     return Array.from({ length: count }, (_, i) => i);
 }
@@ -421,7 +466,15 @@ function getDirectorUiHeight(editor) {
     if (editor?.getDirectorMode?.() === "prompt_batch") {
         return getImageBatchUiHeight(editor) + 140 + peH;
     }
-    return (editor?.canvasHeight || RULER_H + TRACK_H) + 370 + 52 + peH;
+    let h = (editor?.canvasHeight || RULER_H + SEG_LABEL_H + TRACK_H) + 370 + 52 + peH;
+    if (
+        editor?.hasVideo?.()
+        && !editor?.isImageBatch?.()
+        && !editor?.isGenMode?.()
+    ) {
+        h += STAGE_PREVIEW_H + 10;
+    }
+    return h;
 }
 
 function hookTaskTypeWidget(node) {
@@ -608,6 +661,7 @@ function parseTimeline(raw, totalFrames, fps) {
             continuityOverlapFrames: data.output?.continuityOverlapFrames ?? data.output?.continuity_overlap_frames,
         });
         stripTimelineContinuityRootFields(data);
+        stripTimelineEphemeralFields(data);
         const legacyFrames = data.video.frames?.length || 0;
         if (!data.video.frameMap?.length) {
             const n = data.totalFrames || data.video.sourceFrameCount || legacyFrames || total;
@@ -711,7 +765,10 @@ class BerniniDirectorEditor {
         this._drawWidth = 0;
         this._reorderDropRank = -1;
         this._reorderFromRank = -1;
-        this.canvasHeight = RULER_H + TRACK_H;
+        this.canvasHeight = RULER_H + SEG_LABEL_H + TRACK_H;
+        this._stageClipIndex = -1;
+        this._stageSyncMs = 0;
+        this._playHandoff = false;
 
         for (const w of node.widgets || []) {
             if (HIDDEN_WIDGETS.includes(w.name)) hideWidget(w);
@@ -833,6 +890,7 @@ class BerniniDirectorEditor {
             }
             const batchBody = { ...this.timeline };
             stripTimelineContinuityRootFields(batchBody);
+            stripTimelineEphemeralFields(batchBody);
             return {
                 ...batchBody,
                 version: 5,
@@ -867,6 +925,7 @@ class BerniniDirectorEditor {
             const mode = this.getDirectorMode();
             const genBody = { ...this.timeline };
             stripTimelineContinuityRootFields(genBody);
+            stripTimelineEphemeralFields(genBody);
             return {
                 ...genBody,
                 version: 5,
@@ -904,6 +963,14 @@ class BerniniDirectorEditor {
         }));
         const { referenceVideo: _legacyRefVideo, reference_video: _legacyRefVideo2, ...timelineBody } = this.timeline;
         stripTimelineContinuityRootFields(timelineBody);
+        stripTimelineEphemeralFields(timelineBody);
+        const clipSourceTotal = clips.reduce(
+            (s, c) => s + (parseInt(c.sourceFrameCount, 10) || 0),
+            0,
+        );
+        const sourceFrameCount = parseInt(video.sourceFrameCount, 10)
+            || clipSourceTotal
+            || (frameMap.length ? 0 : this.getTotalFrames());
         return {
             ...timelineBody,
             version: 4,
@@ -925,8 +992,8 @@ class BerniniDirectorEditor {
             video: {
                 ...video,
                 frameMap,
-                sourceFrameCount: video.sourceFrameCount || this.getTotalFrames(),
-                deletedSourceRanges: video.deletedSourceRanges || [],
+                sourceFrameCount,
+                deletedSourceRanges: frameMap.length ? [] : (video.deletedSourceRanges || []),
                 frames: this._legacyFrames.length ? this._legacyFrames : [],
                 storageWidth: storageW,
                 storageHeight: storageH,
@@ -995,21 +1062,33 @@ class BerniniDirectorEditor {
         this.mainBody.className = "bd-main";
         this.root.appendChild(this.mainBody);
 
-        this.viewport = document.createElement("div");
-        this.viewport.className = "bd-viewport";
-        this.canvas = document.createElement("canvas");
-        this.canvas.className = "bd-canvas";
-        this.viewport.appendChild(this.canvas);
-        this.mainBody.appendChild(this.viewport);
-        this.ctx = this.canvas.getContext("2d");
+        const stage = document.createElement("div");
+        stage.className = "bd-stage hidden";
+        stage.setAttribute("data-r", "video-stage");
+        stage.innerHTML = `
+            <video class="bd-stage-video hidden" data-r="stage-video" muted playsinline preload="auto"></video>
+            <img class="bd-stage-img hidden" data-r="stage-img" alt="">
+            <div class="bd-stage-empty" data-r="stage-empty">上传视频后可在此预览播放</div>
+            <div class="bd-stage-badge hidden" data-r="stage-badge"></div>`;
+        this.mainBody.appendChild(stage);
 
+        // Playback bar sits between video stage and timeline edit area.
         const controls = document.createElement("div");
         controls.className = "bd-controls";
         controls.innerHTML = `
             <div class="bd-player">
                 <button type="button" class="bd-icon-btn" data-a="play" title="播放 / 暂停">▶</button>
                 <button type="button" class="bd-icon-btn" data-a="loop" title="循环播放：开启后预览播放到末尾会自动从头开始">⟳</button>
-                <input type="range" class="bd-seek" data-r="seek" min="0" value="0">
+                <button type="button" class="bd-icon-btn" data-a="frame-prev" title="上一帧 (←)">‹</button>
+                <button type="button" class="bd-icon-btn" data-a="frame-next" title="下一帧 (→)">›</button>
+                <span class="bd-frame-jump" title="输入帧号后回车定位（从 1 开始）">
+                    <span>帧</span>
+                    <input type="number" class="bd-frame-input" data-r="frame-input" min="1" step="1" value="1">
+                    <span>/</span>
+                    <span class="bd-frame-total" data-r="frame-total">0</span>
+                </span>
+                <div class="bd-timecode" data-r="player-timecode">0.00 / 0.00</div>
+                <input type="range" class="bd-seek" data-r="seek" min="0" value="0" step="1">
                 <div class="bd-zoom bd-row">
                     <button type="button" class="bd-icon-btn" data-a="zoom-out">−</button>
                     <input type="range" data-r="zoom" min="1" max="10" step="0.25" value="1" style="width:80px">
@@ -1017,6 +1096,14 @@ class BerniniDirectorEditor {
                 </div>
             </div>`;
         this.mainBody.appendChild(controls);
+
+        this.viewport = document.createElement("div");
+        this.viewport.className = "bd-viewport";
+        this.canvas = document.createElement("canvas");
+        this.canvas.className = "bd-canvas";
+        this.viewport.appendChild(this.canvas);
+        this.mainBody.appendChild(this.viewport);
+        this.ctx = this.canvas.getContext("2d");
 
         const outputBar = document.createElement("div");
         outputBar.className = "bd-output";
@@ -1165,8 +1252,21 @@ class BerniniDirectorEditor {
         this.equalCountInput = this.root.querySelector('[data-r="equal-n"]');
         this.boundsEl = this.root.querySelector('[data-r="bounds"]');
         this.timecodeEl = this.root.querySelector('[data-r="timecode"]');
+        this.playerTimecodeEl = this.root.querySelector('[data-r="player-timecode"]');
+        this.frameInputEl = this.root.querySelector('[data-r="frame-input"]');
+        this.frameTotalEl = this.root.querySelector('[data-r="frame-total"]');
         this.seekBar = this.root.querySelector('[data-r="seek"]');
         this.zoomSlider = this.root.querySelector('[data-r="zoom"]');
+        this.stageEl = this.root.querySelector('[data-r="video-stage"]');
+        this.stageVideo = this.root.querySelector('[data-r="stage-video"]');
+        this.stageImg = this.root.querySelector('[data-r="stage-img"]');
+        this.stageEmpty = this.root.querySelector('[data-r="stage-empty"]');
+        this.stageBadge = this.root.querySelector('[data-r="stage-badge"]');
+        if (this.stageVideo) {
+            this.stageVideo.crossOrigin = "anonymous";
+            this.stageVideo.muted = true;
+            this.stageVideo.playsInline = true;
+        }
         this.globalTask = this.root.querySelector('[data-r="global-task"]');
         this.globalPanel = this.root.querySelector('[data-r="global-panel"]');
         this.globalPanelTitle = this.globalPanel?.querySelector("b");
@@ -1261,10 +1361,53 @@ class BerniniDirectorEditor {
         bind('[data-a="mode-segment"]', () => this.setEditMode("segment"));
         bind('[data-a="play"]', () => this.togglePlay());
         bind('[data-a="loop"]', () => this.toggleLoop());
+        bind('[data-a="frame-prev"]', () => this.stepFrame(-1));
+        bind('[data-a="frame-next"]', () => this.stepFrame(1));
         bind('[data-a="zoom-in"]', () => this.adjustZoom(0.5));
         bind('[data-a="zoom-out"]', () => this.adjustZoom(-0.5));
 
-        this.seekBar.oninput = () => { this.currentFrame = +this.seekBar.value; this.scheduleRender(); };
+        this.seekBar.oninput = () => {
+            this.seekToFrame(+this.seekBar.value, { fromUi: true });
+        };
+        if (this.frameInputEl) {
+            const applyFrameInput = () => {
+                const total = this.getTotalFrames();
+                if (total < 1) return;
+                const raw = parseInt(this.frameInputEl.value, 10);
+                if (!Number.isFinite(raw)) {
+                    this.frameInputEl.value = String(this.currentFrame + 1);
+                    return;
+                }
+                // UI is 1-based; internal currentFrame is 0-based.
+                this.seekToFrame(raw - 1, { fromUi: true });
+            };
+            this.frameInputEl.addEventListener("keydown", (e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    applyFrameInput();
+                    this.frameInputEl.blur();
+                } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    this.frameInputEl.value = String(this.currentFrame + 1);
+                    this.frameInputEl.blur();
+                }
+            });
+            this.frameInputEl.addEventListener("change", applyFrameInput);
+            this.frameInputEl.addEventListener("focus", () => {
+                if (this.isPlaying) this._stopPlay();
+                this.frameInputEl.select();
+            });
+        }
+        if (this.stageBadge) {
+            this.stageBadge.title = "点击输入精确帧号";
+            this.stageBadge.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (this.isPlaying) this._stopPlay();
+                this.frameInputEl?.focus();
+                this.frameInputEl?.select();
+            });
+        }
         this.zoomSlider.oninput = () => { this.zoom = +this.zoomSlider.value; this.applyZoomWidth(); this.scheduleRender(); };
         if (this.runSelectAllCb) {
             this.runSelectAllCb.onchange = (e) => {
@@ -1348,6 +1491,12 @@ class BerniniDirectorEditor {
                 this.deleteSelectedSegment(); e.preventDefault();
             } else if (e.code === "Space") {
                 this.togglePlay(); e.preventDefault();
+            } else if (e.key === "ArrowLeft") {
+                this.stepFrame(e.shiftKey ? -10 : -1);
+                e.preventDefault();
+            } else if (e.key === "ArrowRight") {
+                this.stepFrame(e.shiftKey ? 10 : 1);
+                e.preventDefault();
             }
         };
         window.addEventListener("keydown", this._onKeyDown, true);
@@ -1573,7 +1722,10 @@ class BerniniDirectorEditor {
         this.batchRunSelectBtn?.classList.toggle("hidden", !useBatchBar);
         this.runSelectAllWrap?.classList.toggle("hidden", !enabled || useBatchBar);
         this.batchRunSelectAllWrap?.classList.toggle("hidden", !enabled || !useBatchBar);
-        this.runSelectBar?.classList.toggle("hidden", !enabled);
+        // Keep the chip hidden while a run is active — otherwise commit/sync
+        // re-shows it on top of the green progress title.
+        const running = !!this.runStatusEl?.classList.contains("active");
+        this.runSelectBar?.classList.toggle("hidden", !enabled || running);
         if (!canRunSelect) return;
         this.normalizeRunSelection();
         const count = (this.timeline.runSelection || []).length;
@@ -1637,6 +1789,93 @@ class BerniniDirectorEditor {
     onTaskTypeChanged(value) {
         this.onGlobalField("taskType", value);
         this._promptEnhancer?.onTaskTypeChanged?.();
+    }
+
+    /** Snapshot v2v/rv2v workspace before switching to t2i / batch / gen modes. */
+    _stashVideoWorkspace() {
+        const video = this.timeline.video || {};
+        const clips = this.timeline.videoClips || [];
+        const hasVid = !!(
+            clips.length
+            || video.videoFile
+            || video.fileName
+            || this._legacyFrames?.length
+            || video.frames?.length
+        );
+        const segs = this.timeline.segments || [];
+        if (!hasVid && !segs.length) return;
+
+        this.timeline.videoWorkspace = {
+            segments: JSON.parse(JSON.stringify(segs)),
+            selectedIndex: this.selectedIndex,
+            currentFrame: this.currentFrame,
+            editMode: this.timeline.editMode || "global",
+            runSelectEnabled: !!this.timeline.runSelectEnabled,
+            runSelection: Array.isArray(this.timeline.runSelection)
+                ? [...this.timeline.runSelection]
+                : undefined,
+            video: JSON.parse(JSON.stringify(video)),
+            videoClips: JSON.parse(JSON.stringify(clips)),
+            totalFrames: this.timeline.totalFrames ?? this.getTotalFrames(),
+            frameRate: this.timeline.frameRate ?? this.getFrameRate(),
+            legacyFrames: this._legacyFrames?.length ? [...this._legacyFrames] : [],
+            storageWidth: this._storageWidth || 0,
+            storageHeight: this._storageHeight || 0,
+        };
+    }
+
+    /** Restore v2v/rv2v workspace after returning from t2i / batch / gen. */
+    _restoreVideoWorkspace() {
+        const ws = this.timeline.videoWorkspace;
+        if (!ws || typeof ws !== "object") {
+            this.normalizeSegments();
+            this.restoreVideoFromTimeline();
+            this.updateStageVisibility();
+            return false;
+        }
+
+        if (ws.video && typeof ws.video === "object") {
+            this.timeline.video = JSON.parse(JSON.stringify(ws.video));
+        }
+        if (Array.isArray(ws.videoClips)) {
+            this.timeline.videoClips = JSON.parse(JSON.stringify(ws.videoClips));
+        }
+        if (Array.isArray(ws.segments) && ws.segments.length) {
+            this.timeline.segments = JSON.parse(JSON.stringify(ws.segments));
+        }
+        if (ws.totalFrames != null) this.timeline.totalFrames = ws.totalFrames;
+        if (ws.frameRate != null) this.timeline.frameRate = ws.frameRate;
+        if (ws.editMode) this.timeline.editMode = ws.editMode;
+        if (ws.runSelectEnabled != null) this.timeline.runSelectEnabled = !!ws.runSelectEnabled;
+        if (Array.isArray(ws.runSelection)) this.timeline.runSelection = [...ws.runSelection];
+
+        this.selectedIndex = clamp(
+            ws.selectedIndex ?? 0,
+            0,
+            Math.max(0, (this.timeline.segments?.length || 1) - 1),
+        );
+        this.currentFrame = Math.max(0, ws.currentFrame ?? 0);
+        if (Array.isArray(ws.legacyFrames) && ws.legacyFrames.length) {
+            this._legacyFrames = [...ws.legacyFrames];
+        }
+        if (ws.storageWidth) this._storageWidth = ws.storageWidth;
+        if (ws.storageHeight) this._storageHeight = ws.storageHeight;
+
+        this.normalizeSegments();
+        this.restoreVideoFromTimeline();
+        const total = this.getTotalFrames();
+        this.currentFrame = clamp(this.currentFrame, 0, Math.max(0, total - 1));
+        if (this.seekBar) {
+            this.seekBar.max = Math.max(0, total - 1);
+            this.seekBar.value = this.currentFrame;
+        }
+        if (this.totalFramesWidget) this.totalFramesWidget.value = total;
+        this.updateVideoNameLabel();
+        this.updateStageVisibility();
+        // Live state is now in timeline.*; drop the snapshot so later edits
+        // cannot be overwritten by a stale workspace on the next mode switch.
+        this.timeline.videoWorkspace = null;
+        return true;
     }
 
     ensureGenTimeline() {
@@ -1740,7 +1979,11 @@ class BerniniDirectorEditor {
 
         if (isBatch) {
             if (!wasBatch) {
-                const keep = this.timeline.segments?.[0]?.prompt || this.timeline.global?.prompt || "";
+                // Keep v2v/rv2v video + segments so switching back can restore them.
+                if (prev === "video") this._stashVideoWorkspace();
+                const keep = this.timeline.global?.prompt
+                    || this.timeline.segments?.[0]?.prompt
+                    || "";
                 this.timeline.segments = [newBatchSegment({
                     prompt: keep,
                     negativePrompt: this.negativePromptWidget?.value || "bad video",
@@ -1749,6 +1992,7 @@ class BerniniDirectorEditor {
             ensureImageBatchTimeline(this);
         } else if (isGen) {
             if (!wasGen && !wasBatch) {
+                if (prev === "video") this._stashVideoWorkspace();
                 const key = this.getTaskKey();
                 const defFc = defaultFrameCount(key);
                 const keepPrompt = this.timeline.global?.prompt || "";
@@ -1766,7 +2010,10 @@ class BerniniDirectorEditor {
             this.ensureGenTimeline();
         } else if (prev !== "video") {
             this.timeline.timelineMode = "video";
-            this.normalizeSegments();
+            // Prefer restoring the stashed v2v/rv2v session (segments + thumbs source).
+            if (!this._restoreVideoWorkspace()) {
+                this.normalizeSegments();
+            }
         }
         this.timeline.timelineMode = mode;
         this._directorMode = mode;
@@ -1780,6 +2027,7 @@ class BerniniDirectorEditor {
         this.boundsEl?.classList.toggle("hidden", hideTimeline || isBatch);
         this.timecodeEl?.classList.toggle("hidden", hideTimeline || isBatch);
         this.viewport?.classList.toggle("hidden", isBatch);
+        this.updateStageVisibility();
         this.root.querySelector(".bd-split")?.classList.toggle("hidden", isBatch);
         this.batchPanel?.classList.toggle("hidden", !isBatch);
         setToolbarDisabledForBatch(this, isBatch);
@@ -2337,14 +2585,15 @@ class BerniniDirectorEditor {
         if (this.isImageBatch() || this.isGenMode()) return sumFrameCounts(this.timeline.segments);
         const mapLen = this.timeline?.video?.frameMap?.length || 0;
         if (mapLen > 0) return mapLen;
-        const total = Math.max(0, parseInt(this.timeline?.totalFrames || this.totalFramesWidget?.value || 0, 10));
-        if (total > 0) return total;
-        if (!this.hasVideo()) return 0;
+        // Sparse deletes: sourceFrameCount − ranges beats a stale totalFrames.
         const src = parseInt(this.timeline?.video?.sourceFrameCount || 0, 10);
         if (src > 0) {
             const removed = deletedSourceRanges(this.timeline.video).reduce((s, [a, b]) => s + (b - a), 0);
             return Math.max(0, src - removed);
         }
+        const total = Math.max(0, parseInt(this.timeline?.totalFrames || this.totalFramesWidget?.value || 0, 10));
+        if (total > 0) return total;
+        if (!this.hasVideo()) return 0;
         return 0;
     }
 
@@ -2942,6 +3191,195 @@ class BerniniDirectorEditor {
         return this._seekChain;
     }
 
+    updateStageVisibility() {
+        if (!this.stageEl) return;
+        const show = this.hasVideo()
+            && !this.isImageBatch()
+            && !this.isGenMode();
+        this.stageEl.classList.toggle("hidden", !show);
+        if (!show) {
+            if (this.stageVideo) {
+                this.stageVideo.pause();
+                this.stageVideo.classList.add("hidden");
+            }
+            this.stageImg?.classList.add("hidden");
+            this.stageEmpty?.classList.remove("hidden");
+            this.stageBadge?.classList.add("hidden");
+            this._stageClipIndex = -1;
+        } else {
+            this._syncStagePreview(this.currentFrame, { force: true });
+        }
+        this.updateDomWidgetHeight();
+        syncDirectorNodeSize(this.node, this);
+    }
+
+    _updateStageBadge(logicalFrame) {
+        if (!this.stageBadge) return;
+        const total = this.getTotalFrames();
+        const frame = clamp(logicalFrame | 0, 0, Math.max(0, total - 1));
+        const clips = this.getVideoClips();
+        const entry = this.getFrameMapEntry(frame);
+        const clipHint = clips.length > 1 ? ` · 片${entry.clip + 1}` : "";
+        this.stageBadge.textContent = `帧 ${frame + 1}/${total}${clipHint}`;
+        this.stageBadge.classList.remove("hidden");
+    }
+
+    _logicalRangeForClip(clipIndex) {
+        const map = this.getFrameMap();
+        let start = -1;
+        let end = -1;
+        for (let i = 0; i < map.length; i++) {
+            const e = normalizeFrameMapEntry(map[i]);
+            if (e.clip !== clipIndex) {
+                if (start >= 0) break;
+                continue;
+            }
+            if (start < 0) start = i;
+            end = i + 1;
+        }
+        if (start < 0) return { start: 0, end: this.getTotalFrames() };
+        return { start, end };
+    }
+
+    _logicalFromStageTime(clipIndex, timeSec) {
+        const fps = Math.max(0.001, this.getFrameRate());
+        const srcFrame = Math.max(0, Math.round(Number(timeSec) * fps));
+        const map = this.getFrameMap();
+        if (!map.length) {
+            const logical = sourceToLogicalFrame(srcFrame, this.timeline.video || {});
+            if (logical < 0) return -1; // source lands in a deleted gap
+            return clamp(logical, 0, Math.max(0, this.getTotalFrames() - 1));
+        }
+        let first = -1;
+        let best = -1;
+        for (let i = 0; i < map.length; i++) {
+            const e = normalizeFrameMapEntry(map[i]);
+            if (e.clip !== clipIndex) continue;
+            if (first < 0) first = i;
+            if (e.frame === srcFrame) return i;
+            if (e.frame <= srcFrame) best = i;
+        }
+        if (best >= 0) return best;
+        if (first >= 0) return first;
+        return 0;
+    }
+
+    /** Next logical index whose source frame is strictly after srcFrame (same clip). */
+    _nextLogicalAfterSourceFrame(clipIndex, srcFrame) {
+        const map = this.getFrameMap();
+        if (!map.length) {
+            // Sparse: walk forward until source maps to a kept logical frame.
+            const total = this.getTotalFrames();
+            const startLogical = sourceToLogicalFrame(srcFrame, this.timeline.video || {});
+            const from = startLogical < 0 ? 0 : startLogical;
+            for (let i = from; i < total; i++) {
+                if (this.logicalToSourceFrame(i) > srcFrame) return i;
+            }
+            return -1;
+        }
+        for (let i = 0; i < map.length; i++) {
+            const e = normalizeFrameMapEntry(map[i]);
+            if (e.clip === clipIndex && e.frame > srcFrame) return i;
+        }
+        return -1;
+    }
+
+    _syncStagePreview(logicalFrame, { force = false } = {}) {
+        if (!this.stageEl || this.stageEl.classList.contains("hidden")) return;
+        if (!this.hasVideo()) {
+            this.stageEmpty?.classList.remove("hidden");
+            this.stageVideo?.classList.add("hidden");
+            this.stageImg?.classList.add("hidden");
+            return;
+        }
+
+        // During native playback, do not seek every tick (that causes stutter).
+        // Only refresh the badge; playhead is driven from video.currentTime.
+        if (this.isPlaying && !force && !this._legacyFrames.length) {
+            this._updateStageBadge(logicalFrame);
+            return;
+        }
+
+        const frame = clamp(logicalFrame | 0, 0, Math.max(0, this.getTotalFrames() - 1));
+        const fps = Math.max(0.001, this.getFrameRate());
+
+        if (this._legacyFrames.length) {
+            const dataUrl = this._legacyFrames[frame];
+            if (this.stageVideo) {
+                this.stageVideo.pause();
+                this.stageVideo.classList.add("hidden");
+            }
+            if (this.stageImg && dataUrl) {
+                this.stageImg.src = dataUrl;
+                this.stageImg.classList.remove("hidden");
+                this.stageEmpty?.classList.add("hidden");
+            }
+            this._updateStageBadge(frame);
+            return;
+        }
+
+        const entry = this.getFrameMapEntry(frame);
+        const url = this.getClipViewUrl(entry.clip);
+        const v = this.stageVideo;
+        if (!v || !url) {
+            this.stageEmpty?.classList.remove("hidden");
+            return;
+        }
+
+        this.stageImg?.classList.add("hidden");
+        this.stageEmpty?.classList.add("hidden");
+        v.classList.remove("hidden");
+
+        let sameSrc = false;
+        if (v.src && url) {
+            try {
+                sameSrc = new URL(v.src, location.href).href === new URL(url, location.href).href;
+            } catch {
+                sameSrc = v.src === url;
+            }
+        }
+        // Must reload when the file changes even if clip index stays 0 (replace upload).
+        if (this._stageClipIndex !== entry.clip || !sameSrc) {
+            this._stageClipIndex = entry.clip;
+            if (!sameSrc) {
+                v.pause();
+                v.src = url;
+                v.load();
+            }
+        }
+
+        const target = Math.max(0, entry.frame / fps);
+        if (force || Math.abs(v.currentTime - target) > 0.035) {
+            try {
+                v.currentTime = target;
+            } catch {
+                /* ignore seek races while loading */
+            }
+        }
+        if (this.isPlaying && force) {
+            v.play().catch(() => {});
+        }
+        this._updateStageBadge(frame);
+    }
+
+    async _ensureStageReadyForFrame(logicalFrame) {
+        this._syncStagePreview(logicalFrame, { force: true });
+        const v = this.stageVideo;
+        if (!v || this._legacyFrames.length) return false;
+        if (v.readyState >= 2) return true;
+        await new Promise((resolve) => {
+            const done = () => {
+                v.removeEventListener("loadeddata", done);
+                v.removeEventListener("canplay", done);
+                resolve();
+            };
+            v.addEventListener("loadeddata", done);
+            v.addEventListener("canplay", done);
+            setTimeout(done, 800);
+        });
+        return true;
+    }
+
     _queueThumbPrefetch(logicalFrame) {
         if (this.isPlaying) return;
         if (this._thumbCache.has(logicalFrame) || this._thumbPending.has(logicalFrame)) return;
@@ -2984,7 +3422,22 @@ class BerniniDirectorEditor {
         this._thumbPending.clear();
         this._legacyFrames = [];
         this.timeline.videoClips = [];
-        this.setFrameMap([]);
+        this.timeline.videoWorkspace = null;
+        // Wipe video identity BEFORE visibility sync — otherwise hasVideo() stays
+        // true via the old videoFile and stage reloads the previous clip.
+        this.timeline.video = {
+            fileName: "",
+            videoFile: "",
+            subfolder: "",
+            type: "input",
+            frames: [],
+            frameMap: [],
+            deletedSourceRanges: [],
+            sourceFrameCount: 0,
+            width: 0,
+            height: 0,
+        };
+        this.timeline.totalFrames = 0;
         this._storageWidth = 0;
         this._storageHeight = 0;
         this._clearPreviewVideos(true);
@@ -2993,21 +3446,23 @@ class BerniniDirectorEditor {
             this._previewVideo.removeAttribute("src");
             this._previewVideo.load();
         }
+        if (this.stageVideo) {
+            this.stageVideo.pause();
+            this.stageVideo.removeAttribute("src");
+            this.stageVideo.load();
+            this.stageVideo.classList.add("hidden");
+        }
+        this.stageImg?.classList.add("hidden");
+        if (this.stageImg) this.stageImg.removeAttribute("src");
+        this.stageEmpty?.classList.remove("hidden");
+        this.stageBadge?.classList.add("hidden");
+        this._stageClipIndex = -1;
+        this.updateStageVisibility();
     }
 
     _resetTimelineForReplaceUpload() {
         this._clearVideoState();
         this.timeline.segments = [];
-        this.timeline.video = {
-            fileName: "",
-            videoFile: "",
-            subfolder: "",
-            type: "input",
-            frames: [],
-            frameMap: [],
-            width: 0,
-            height: 0,
-        };
         this.selectedIndex = 0;
         this.currentFrame = 0;
         if (this.seekBar) {
@@ -3040,6 +3495,7 @@ class BerniniDirectorEditor {
             this.setFrameMap(buildIdentityFrameMap(legacy.length));
             this.videoNameEl.textContent = `${video.fileName || "视频"} (${legacy.length}f · 旧版内嵌)`;
             this._prefetchSegmentThumbs(0, legacy.length);
+            this.updateStageVisibility();
             return;
         }
 
@@ -3055,6 +3511,7 @@ class BerniniDirectorEditor {
         if (taskUsesReferenceVideo(this.getTaskKey()) && this.getReferenceVideoViewUrl(this.timeline.global?.referenceVideo)) {
             this.renderRefVideoSlot();
         }
+        this.updateStageVisibility();
     }
 
     _prefetchSegmentThumbs(from, to) {
@@ -3341,11 +3798,23 @@ class BerniniDirectorEditor {
     _syncPrimaryVideoFromClips(frameMap) {
         const clips = this.getVideoClips();
         const primary = clips[0] || {};
+        const prev = this.timeline.video || {};
+        const map = Array.isArray(frameMap) ? frameMap : (prev.frameMap || []);
         this.timeline.video = {
+            ...prev,
             ...primary,
-            frames: this.timeline.video?.frames || [],
-            frameMap,
+            // Keep path/type from the clip record, but never drop timeline edits.
+            fileName: primary.fileName || prev.fileName || "",
+            videoFile: primary.videoFile || prev.videoFile || "",
+            subfolder: primary.subfolder ?? prev.subfolder ?? "",
+            type: primary.type || prev.type || "input",
+            frames: prev.frames || [],
+            frameMap: map,
+            // Explicit map already encodes deletes; sparse mode keeps ranges.
+            deletedSourceRanges: map.length ? [] : (prev.deletedSourceRanges || []),
+            sourceFrameCount: prev.sourceFrameCount || primary.sourceFrameCount || map.length || 0,
         };
+        if (map.length) this.timeline.totalFrames = map.length;
     }
 
     async _applyLoadedVideo({ fileName, relPath, subfolder, type, statusPrefix }) {
@@ -3365,10 +3834,21 @@ class BerniniDirectorEditor {
         this._previewVideo = this._getPreviewVideoForClip(0);
         if (this._previewVideo && viewUrl) this._previewVideo.src = viewUrl;
 
+        // Force stage to drop any previous media before binding the new clip.
+        this._stageClipIndex = -1;
+        if (this.stageVideo) {
+            this.stageVideo.pause();
+            this.stageVideo.removeAttribute("src");
+            this.stageVideo.load();
+        }
+        this.currentFrame = 0;
+
         if (this.totalFramesWidget) this.totalFramesWidget.value = totalFrames;
         this.syncOutputUIFromTimeline();
         this.updateVideoNameLabel();
         this._prefetchSegmentThumbs(0, Math.min(totalFrames, THUMB_PREFETCH_BATCH * 4));
+        this.updateStageVisibility();
+        this._syncStagePreview(0, { force: true });
         this.commit(false, { syncTimeline: true });
     }
 
@@ -3419,6 +3899,7 @@ class BerniniDirectorEditor {
         this.syncOutputUIFromTimeline();
         this.updateVideoNameLabel();
         this._prefetchSegmentThumbs(prevTotal, Math.min(prevTotal + totalFrames, prevTotal + THUMB_PREFETCH_BATCH * 4));
+        this.updateStageVisibility();
         this.commit(false, { syncTimeline: true });
     }
 
@@ -3498,7 +3979,7 @@ class BerniniDirectorEditor {
         if (this.isRunSelectEnabled() && segs.length >= 2) {
             for (let i = segs.length - 1; i >= 0; i--) {
                 const x0 = this.frameToX(segs[i].start, width);
-                if (x >= x0 + 3 && x <= x0 + 19 && y >= RULER_H + 3 && y <= RULER_H + 19) {
+                if (x >= x0 + 3 && x <= x0 + 19 && y >= TRACK_Y + 3 && y <= TRACK_Y + 19) {
                     return { type: "run-check", index: i };
                 }
             }
@@ -3693,35 +4174,53 @@ class BerniniDirectorEditor {
             this.genDeleteSelectedSegment();
             return;
         }
+        if (this.isImageBatch()) {
+            this.genDeleteSelectedSegment();
+            return;
+        }
         const idx = this.selectedIndex;
         const seg = this.timeline.segments[idx];
         if (!seg) return;
 
-        const start = seg.start;
-        const len = seg.length ?? 0;
+        const start = Math.max(0, parseInt(seg.start, 10) || 0);
+        const len = Math.max(0, parseInt(seg.length, 10) || 0);
 
+        // Remove segment UI entry first, then cut matching frames from the
+        // logical timeline so preview / export no longer include that range.
         this.timeline.segments.splice(idx, 1);
 
-        const map = [...this.getFrameMap()];
-        let total;
-        if (len > 0 && map.length) {
-            map.splice(start, len);
-            this.setFrameMap(map);
-            total = map.length;
-        } else if (len > 0) {
-            const video = this.timeline.video || {};
-            video.deletedSourceRanges = video.deletedSourceRanges || [];
-            const srcStart = this.logicalToSourceFrame(start);
-            video.deletedSourceRanges.push([srcStart, srcStart + len]);
-            video.deletedSourceRanges.sort((a, b) => a[0] - b[0]);
-            total = Math.max(0, this.getTotalFrames() - len);
-            this.timeline.totalFrames = total;
-            this.timeline.video = video;
-        } else {
-            total = this.getTotalFrames();
+        let total = this.getTotalFrames();
+        let map = [];
+        if (len > 0 && total > 0) {
+            // Sparse uploads start with an empty frameMap; materialize so we can
+            // splice out the deleted range from the source-frame mapping.
+            if (!this.getFrameMap().length) this.materializeFrameMap();
+            map = [...this.getFrameMap()];
+            if (map.length) {
+                const from = clamp(start, 0, map.length);
+                const count = clamp(len, 0, map.length - from);
+                if (count > 0) map.splice(from, count);
+                this.setFrameMap(map);
+                this._syncPrimaryVideoFromClips(map);
+                total = map.length;
+            } else {
+                // Fallback: record deleted source ranges (kept across sync).
+                const video = this.timeline.video || {};
+                video.deletedSourceRanges = video.deletedSourceRanges || [];
+                const srcStart = this.logicalToSourceFrame(start);
+                video.deletedSourceRanges.push([srcStart, srcStart + len]);
+                video.deletedSourceRanges.sort((a, b) => a[0] - b[0]);
+                this.timeline.video = video;
+                total = this.getTotalFrames();
+                this.timeline.totalFrames = total;
+                this._syncPrimaryVideoFromClips([]);
+            }
         }
+
         this._thumbCache.clear();
         this._thumbPending.clear();
+        // Invalidate stashed workspace — it still contains the deleted range.
+        this.timeline.videoWorkspace = null;
 
         if (this.totalFramesWidget) this.totalFramesWidget.value = total;
 
@@ -3729,7 +4228,10 @@ class BerniniDirectorEditor {
 
         this.selectedIndex = clamp(idx, 0, Math.max(0, this.timeline.segments.length - 1));
         this.currentFrame = clamp(this.currentFrame, 0, Math.max(0, total - 1));
-        if (this.seekBar) this.seekBar.value = this.currentFrame;
+        if (this.seekBar) {
+            this.seekBar.max = Math.max(0, total - 1);
+            this.seekBar.value = this.currentFrame;
+        }
 
         if (!total) {
             this.videoNameEl.textContent = "未上传视频";
@@ -3746,9 +4248,10 @@ class BerniniDirectorEditor {
             };
             this._clearVideoState();
         } else {
-            this._syncPrimaryVideoFromClips(map);
             this.updateVideoNameLabel();
             this._prefetchSegmentThumbs(0, Math.min(total, THUMB_PREFETCH_BATCH * 4));
+            this._syncStagePreview(this.currentFrame, { force: true });
+            this.updateStageVisibility();
         }
 
         this.commit(false, { syncTimeline: true });
@@ -3938,6 +4441,7 @@ class BerniniDirectorEditor {
         this._drawWidth = width;
         this._drawTimelineCanvas(width);
         this._updateTimelineDom();
+        this._syncStagePreview(this.currentFrame);
     }
 
     renderTimelineOnly() {
@@ -3950,6 +4454,7 @@ class BerniniDirectorEditor {
         if (!width) return;
         this._drawWidth = width;
         this._drawTimelineCanvas(width);
+        this._syncStagePreview(this.currentFrame);
     }
 
     _drawTimelineCanvas(width) {
@@ -3991,8 +4496,33 @@ class BerniniDirectorEditor {
             this.ctx.fillText(endLabel, Math.max(2, endX - textW - 2), 11);
         }
 
+        // Frame-range labels above each segment (1-based inclusive, e.g. 1-10).
+        this.ctx.fillStyle = "#1a1a1a";
+        this.ctx.fillRect(0, RULER_H, width, SEG_LABEL_H);
+        this.ctx.font = "10px sans-serif";
+        this.ctx.textBaseline = "middle";
+        for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const x0 = this.frameToX(seg.start, width);
+            const x1 = this.frameToX(seg.start + seg.length, width);
+            const pxW = Math.max(0, x1 - x0);
+            if (pxW < 8 || seg.length <= 0) continue;
+            const a = seg.start + 1;
+            const b = seg.start + seg.length;
+            const rangeText = `${a}-${b}`;
+            this.ctx.fillStyle = i === this.selectedIndex ? "#eee" : "#9a9a9a";
+            let draw = rangeText;
+            if (this.ctx.measureText(draw).width > pxW - 6) {
+                while (draw.length > 1 && this.ctx.measureText(`${draw}…`).width > pxW - 6) {
+                    draw = draw.slice(0, -1);
+                }
+                draw = draw.length < rangeText.length ? `${draw}…` : draw;
+            }
+            this.ctx.fillText(draw, x0 + 4, RULER_H + SEG_LABEL_H / 2);
+        }
+
         this.ctx.fillStyle = "#111";
-        this.ctx.fillRect(0, RULER_H, width, TRACK_H);
+        this.ctx.fillRect(0, TRACK_Y, width, TRACK_H);
 
         const clipBounds = this.getClipBoundaries();
         if (clipBounds.length) {
@@ -4002,8 +4532,8 @@ class BerniniDirectorEditor {
             for (const b of clipBounds) {
                 const bx = this.frameToX(b, width);
                 this.ctx.beginPath();
-                this.ctx.moveTo(bx, RULER_H);
-                this.ctx.lineTo(bx, RULER_H + TRACK_H);
+                this.ctx.moveTo(bx, TRACK_Y);
+                this.ctx.lineTo(bx, TRACK_Y + TRACK_H);
                 this.ctx.stroke();
             }
             this.ctx.setLineDash([]);
@@ -4025,19 +4555,19 @@ class BerniniDirectorEditor {
             } else if (reordering && this._visualRankFromArrayIndex(i) === dragFromRank) {
                 this.ctx.globalAlpha = 0.38;
             }
-            this.drawSegmentThumbnails(this.ctx, seg, x0, pxW, RULER_H, TRACK_H);
-            this.drawPromptOverlay(this.ctx, seg, x0, pxW, RULER_H, TRACK_H);
+            this.drawSegmentThumbnails(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
+            this.drawPromptOverlay(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
             if (this.isRunSelectEnabled() && segs.length >= 2) {
-                this._drawSegmentRunCheck(x0 + 5, RULER_H + 5, runOn);
+                this._drawSegmentRunCheck(x0 + 5, TRACK_Y + 5, runOn);
             }
             const clipIdx = this.getSegmentClipIndex(seg);
             const clipColor = CLIP_SEGMENT_COLORS[clipIdx % CLIP_SEGMENT_COLORS.length];
             this.ctx.strokeStyle = running ? "#4fff8f" : sel ? "#fff" : clipColor;
             this.ctx.lineWidth = running ? 3 : sel ? 2.5 : 1.5;
-            this.ctx.strokeRect(x0 + 0.5, RULER_H + 0.5, pxW - 1, TRACK_H - 1);
+            this.ctx.strokeRect(x0 + 0.5, TRACK_Y + 0.5, pxW - 1, TRACK_H - 1);
             this.ctx.fillStyle = "#ffcc00";
-            this.ctx.fillRect(x0 - 2, RULER_H + TRACK_H / 2 - 12, 4, 24);
-            this.ctx.fillRect(x1 - 2, RULER_H + TRACK_H / 2 - 12, 4, 24);
+            this.ctx.fillRect(x0 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
+            this.ctx.fillRect(x1 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
             this.ctx.globalAlpha = 1;
         }
 
@@ -4047,8 +4577,8 @@ class BerniniDirectorEditor {
             this.ctx.strokeStyle = "#4fff8f";
             this.ctx.lineWidth = 3;
             this.ctx.beginPath();
-            this.ctx.moveTo(ix, RULER_H);
-            this.ctx.lineTo(ix, RULER_H + TRACK_H);
+            this.ctx.moveTo(ix, TRACK_Y);
+            this.ctx.lineTo(ix, TRACK_Y + TRACK_H);
             this.ctx.stroke();
         }
 
@@ -4065,7 +4595,7 @@ class BerniniDirectorEditor {
         if (exportCap > 0 && exportTotal < total) {
             const capX = this.frameToX(exportTotal, width);
             this.ctx.fillStyle = "rgba(0,0,0,0.35)";
-            this.ctx.fillRect(capX, RULER_H, width - capX, TRACK_H);
+            this.ctx.fillRect(capX, TRACK_Y, width - capX, TRACK_H);
             this.ctx.strokeStyle = "#66aaff";
             this.ctx.lineWidth = 2;
             this.ctx.setLineDash([4, 3]);
@@ -4076,18 +4606,66 @@ class BerniniDirectorEditor {
             this.ctx.setLineDash([]);
             this.ctx.fillStyle = "#66aaff";
             this.ctx.font = "10px sans-serif";
-            this.ctx.fillText(`导出 ${exportTotal}`, capX + 4, RULER_H + 12);
+            this.ctx.fillText(`导出 ${exportTotal}`, capX + 4, TRACK_Y + 12);
         }
     }
 
     _updateTimelineDom({ skipSeek = false } = {}) {
         const segs = this._previewSegments || this.timeline.segments;
-        this.timecodeEl.textContent = `${this.formatTime(this.currentFrame)}s`;
-        if (!skipSeek && +this.seekBar.value !== this.currentFrame) {
+        const totalFrames = Math.max(0, this.getTotalFrames());
+        const cur = this.formatTime(this.currentFrame);
+        const total = this.formatTime(totalFrames);
+        if (this.timecodeEl) this.timecodeEl.textContent = `${cur}s`;
+        if (this.playerTimecodeEl) this.playerTimecodeEl.textContent = `${cur} / ${total}`;
+        if (this.frameTotalEl) this.frameTotalEl.textContent = String(totalFrames);
+        if (this.frameInputEl) {
+            this.frameInputEl.max = String(Math.max(1, totalFrames));
+            // Don't overwrite while the user is typing a target frame.
+            if (document.activeElement !== this.frameInputEl) {
+                this.frameInputEl.value = String(totalFrames > 0 ? this.currentFrame + 1 : 1);
+            }
+        }
+        if (!skipSeek && this.seekBar && +this.seekBar.value !== this.currentFrame) {
             this.seekBar.value = this.currentFrame;
         }
+        if (this.seekBar) this.seekBar.max = Math.max(0, totalFrames - 1);
         const seg = segs[this.selectedIndex];
         if (seg) this.boundsEl.textContent = `Start: ${this.formatTime(seg.start)} | End: ${this.formatTime(seg.start + seg.length)}`;
+    }
+
+    /** Jump to an exact 0-based logical frame; syncs seek bar, preview, playhead. */
+    seekToFrame(frame, { fromUi = false } = {}) {
+        const total = this.getTotalFrames();
+        if (total < 1) return;
+        if (this.isPlaying) this._stopPlay();
+        const next = clamp(Math.round(Number(frame) || 0), 0, total - 1);
+        this.currentFrame = next;
+        if (this.seekBar) {
+            this.seekBar.max = Math.max(0, total - 1);
+            this.seekBar.value = next;
+        }
+        this._syncStagePreview(next, { force: true });
+        this._updateTimelineDom({ skipSeek: true });
+        // Select the segment that contains this frame for editing context.
+        const segs = this.timeline.segments || [];
+        for (let i = 0; i < segs.length; i++) {
+            const s = segs[i];
+            if (next >= s.start && next < s.start + s.length) {
+                if (this.selectedIndex !== i) {
+                    this.selectedIndex = i;
+                    this.updateSelectionUI();
+                }
+                break;
+            }
+        }
+        this.scheduleRender();
+        if (fromUi) this._queueThumbPrefetch?.(next);
+    }
+
+    stepFrame(delta) {
+        const total = this.getTotalFrames();
+        if (total < 1) return;
+        this.seekToFrame(this.currentFrame + (Number(delta) || 0), { fromUi: true });
     }
 
     formatTime(frames) { return (frames / this.getFrameRate()).toFixed(2); }
@@ -4317,12 +4895,16 @@ class BerniniDirectorEditor {
             this.runOverallEl.style.width = "100%";
             this.runPhaseEl.style.width = "100%";
             this._runHighlightSeg = -1;
+            this.updateRunSelectUI();
             if (this.isImageBatch()) this.renderImageBatchGroups();
             else this.scheduleRender();
             return;
         }
 
         this.runStatusEl.className = "bd-run-status active";
+        // Hide the pre-run "将运行 N 段" chip while progress is live — it sits
+        // under the title in the same green accent and reads as a layout glitch.
+        this.runSelectBar?.classList.add("hidden");
         this._runHighlightSeg = timelineSeg - 1;
         let title;
         if (detail.phase === "plan") {
@@ -4333,6 +4915,9 @@ class BerniniDirectorEditor {
             title = `段 #${timelineSeg}（${runSeg}/${runTotal}）· ${phaseLabel}`;
         } else {
             title = `段 ${runSeg}/${runTotal} · ${phaseLabel}`;
+        }
+        if (phasePct > 0 && detail.phase !== "plan") {
+            title += ` · ${phasePct}%`;
         }
         this.runTitleEl.textContent = title;
         const parts = [];
@@ -4360,6 +4945,7 @@ class BerniniDirectorEditor {
         this.runOverallEl.style.width = "0%";
         this.runPhaseEl.style.width = "0%";
         this._runHighlightSeg = -1;
+        this.updateRunSelectUI();
         if (this.isImageBatch()) this.renderImageBatchGroups();
         else this.scheduleRender();
     }
@@ -4369,14 +4955,21 @@ class BerniniDirectorEditor {
         this.runStatusEl.className = "bd-run-status error";
         this.runTitleEl.textContent = "运行状态：出错";
         this.runDetailEl.textContent = message || "执行中断，请查看终端日志";
+        if (this.runOverallEl) this.runOverallEl.style.width = "0%";
+        if (this.runPhaseEl) this.runPhaseEl.style.width = "0%";
         this._runHighlightSeg = -1;
+        this.updateRunSelectUI();
         this.scheduleRender();
     }
 
     _stopPlay() {
         this.isPlaying = false;
+        this._playHandoff = false;
+        this._nativePlayFailed = false;
         this._pauseSettling = true;
         cancelAnimationFrame(this._playRaf);
+        this._playRaf = null;
+        this.stageVideo?.pause();
         this.root.querySelector('[data-a="play"]').textContent = "▶";
         this._resizeObserver?.disconnect();
 
@@ -4385,6 +4978,7 @@ class BerniniDirectorEditor {
 
         if (w) this._drawTimelineCanvas(w);
         this._updateTimelineDom({ skipSeek: true });
+        this._syncStagePreview(this.currentFrame, { force: true });
 
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
@@ -4394,9 +4988,50 @@ class BerniniDirectorEditor {
                 this._observeViewportResize();
                 const drawW = this.viewport?.clientWidth || w;
                 if (drawW) this._drawTimelineCanvas(drawW);
+                this._syncStagePreview(this.currentFrame, { force: true });
                 this._pauseSettling = false;
             });
         });
+    }
+
+    async _beginNativePlay() {
+        const total = this.getTotalFrames();
+        if (total < 1) return;
+        if (this.currentFrame >= total) this.currentFrame = 0;
+        await this._ensureStageReadyForFrame(this.currentFrame);
+        if (!this.isPlaying) return;
+        const v = this.stageVideo;
+        if (!v) return;
+        try {
+            await v.play();
+        } catch {
+            // Native play blocked/failed — keep isPlaying but drive via frame clock.
+            this._nativePlayFailed = true;
+        }
+    }
+
+    async _advanceNativePlayToNextClipOrEnd() {
+        if (this._playHandoff || !this.isPlaying) return;
+        this._playHandoff = true;
+        try {
+            const total = this.getTotalFrames();
+            const range = this._logicalRangeForClip(this._stageClipIndex);
+            const next = range.end < total ? range.end : -1;
+            if (next >= 0) {
+                this.currentFrame = next;
+                await this._beginNativePlay();
+                return;
+            }
+            if (this.isLooping) {
+                this.currentFrame = 0;
+                await this._beginNativePlay();
+                return;
+            }
+            this.currentFrame = Math.max(0, total - 1);
+            this._stopPlay();
+        } finally {
+            this._playHandoff = false;
+        }
     }
 
     togglePlay() {
@@ -4408,30 +5043,122 @@ class BerniniDirectorEditor {
         if (total < 1) return;
 
         this.isPlaying = true;
+        this._nativePlayFailed = false;
         this.root.querySelector('[data-a="play"]').textContent = "⏸";
         this._lockPlayLayout();
         this._resizeObserver?.disconnect();
 
         if (this.currentFrame >= total) this.currentFrame = 0;
         this.renderTimelineOnly();
-        this.timecodeEl.textContent = `${this.formatTime(this.currentFrame)}s`;
+        this._updateTimelineDom();
+
+        const useNative = !this._legacyFrames.length && !!this.stageVideo;
+        if (useNative) {
+            this._beginNativePlay();
+        } else {
+            this._syncStagePreview(this.currentFrame, { force: true });
+        }
 
         const tick = () => {
             if (!this.isPlaying) return;
-            this.currentFrame += 1;
-            if (this.currentFrame >= total) {
-                if (this.isLooping) this.currentFrame = 0;
-                else {
-                    this.currentFrame = total - 1;
-                    this._stopPlay();
+            const fps = Math.max(0.001, this.getFrameRate());
+
+            if (useNative && this.stageVideo && !this._nativePlayFailed) {
+                const v = this.stageVideo;
+                const clipIndex = this._stageClipIndex >= 0 ? this._stageClipIndex : 0;
+                const range = this._logicalRangeForClip(clipIndex);
+                const lastLogical = Math.max(range.start, range.end - 1);
+                const lastTime = this.getFrameMapEntry(lastLogical).frame / fps;
+                const atMappedEnd = v.currentTime >= Math.max(0, lastTime - 0.04);
+                const hasTimelineEdits = !!(
+                    this.getFrameMap().length
+                    || deletedSourceRanges(this.timeline.video || {}).length
+                );
+                // With deletes, file duration still includes removed tails — trust mapped end.
+                const atMediaEnd = !hasTimelineEdits && (
+                    v.ended || (v.duration > 0 && v.currentTime >= v.duration - 0.04)
+                );
+
+                if ((atMappedEnd || atMediaEnd) && !v.seeking && !this._playHandoff) {
+                    this.currentFrame = lastLogical;
+                    this.renderTimelineOnly();
+                    this._updateTimelineDom();
+                    this._advanceNativePlayToNextClipOrEnd();
+                    if (this.isPlaying) this._playRaf = requestAnimationFrame(tick);
                     return;
                 }
-            }
-            this.renderTimelineOnly();
-            const now = performance.now();
-            if (now - this._lastSeekUiMs > 120) {
-                this.timecodeEl.textContent = `${this.formatTime(this.currentFrame)}s`;
-                this._lastSeekUiMs = now;
+
+                if (!v.paused) {
+                    const srcFrame = Math.max(0, Math.round(v.currentTime * fps));
+                    let logical = this._logicalFromStageTime(clipIndex, v.currentTime);
+                    const jumpToKept = () => {
+                        const nextLogical = this._nextLogicalAfterSourceFrame(clipIndex, srcFrame);
+                        if (nextLogical >= 0) {
+                            const nextSrc = this.getFrameMapEntry(nextLogical).frame;
+                            try { v.currentTime = nextSrc / fps; } catch { /* seek race */ }
+                            return nextLogical;
+                        }
+                        return -1;
+                    };
+                    // Sparse deleted gap, or mid/leading gap vs mapped source.
+                    if (logical < 0) {
+                        const next = jumpToKept();
+                        if (next < 0) {
+                            this.currentFrame = lastLogical;
+                            this.renderTimelineOnly();
+                            this._updateTimelineDom();
+                            this._advanceNativePlayToNextClipOrEnd();
+                            if (this.isPlaying) this._playRaf = requestAnimationFrame(tick);
+                            return;
+                        }
+                        logical = next;
+                    } else {
+                        const mapped = this.getFrameMapEntry(logical);
+                        if (mapped.clip === clipIndex && mapped.frame !== srcFrame) {
+                            // leading gap (mapped > src) or mid gap (mapped < src)
+                            if (mapped.frame > srcFrame || mapped.frame < srcFrame) {
+                                const next = mapped.frame > srcFrame ? logical : jumpToKept();
+                                if (next < 0) {
+                                    this.currentFrame = clamp(logical, 0, total - 1);
+                                    this.renderTimelineOnly();
+                                    this._updateTimelineDom();
+                                    this._advanceNativePlayToNextClipOrEnd();
+                                    if (this.isPlaying) this._playRaf = requestAnimationFrame(tick);
+                                    return;
+                                }
+                                if (mapped.frame > srcFrame) {
+                                    try { v.currentTime = mapped.frame / fps; } catch { /* seek race */ }
+                                }
+                                logical = next;
+                            }
+                        }
+                    }
+                    this.currentFrame = clamp(logical, 0, total - 1);
+                    this.renderTimelineOnly();
+                    const now = performance.now();
+                    if (now - this._lastSeekUiMs > 66) {
+                        this._updateTimelineDom();
+                        this._lastSeekUiMs = now;
+                    }
+                }
+            } else {
+                // Legacy embedded frames (or native play unavailable): step by logical frame.
+                this.currentFrame += 1;
+                if (this.currentFrame >= total) {
+                    if (this.isLooping) this.currentFrame = 0;
+                    else {
+                        this.currentFrame = total - 1;
+                        this._stopPlay();
+                        return;
+                    }
+                }
+                this.renderTimelineOnly();
+                this._syncStagePreview(this.currentFrame, { force: true });
+                const now = performance.now();
+                if (now - this._lastSeekUiMs > 80) {
+                    this._updateTimelineDom();
+                    this._lastSeekUiMs = now;
+                }
             }
             this._playRaf = requestAnimationFrame(tick);
         };

@@ -38,6 +38,7 @@ from .segment_continuity import (
     apply_cached_segment_continuity,
     apply_scail_continuity_core,
     concat_continuous_chunks,
+    is_continuity_active,
     match_clip_to_gen_length,
     prepend_continuity_source,
     resolve_prev_segment_output,
@@ -127,10 +128,13 @@ def execute_director_plan_core(
         )
 
         is_one_frame_i2v = seg.task_key == "i2v" and seg.source_clip is not None
+        # Per-segment gate: task must support continuity (v2v/rv2v/…) — never trim
+        # t2v/r2v/gen heads just because the global checkbox is on.
+        seg_continuity = is_continuity_active(plan, seg)
         # Continuity may need a few frames past the segment end so gen length
         # matches a fully-conditioned source canvas (avoids hollow-tail freeze).
         lookahead = 0
-        if plan.continuity_enabled and seg.index > 0 and not is_one_frame_i2v:
+        if seg_continuity and not is_one_frame_i2v:
             lookahead = CONTINUITY_SEAM_ECHO_BUDGET + 4
         raw_clip = resolve_segment_raw_clip_with_lookahead(
             plan, seg, end_extra=lookahead
@@ -156,7 +160,7 @@ def execute_director_plan_core(
         if is_one_frame_i2v:
             num_frames = wan_align_frame_count(target_len)
             prefix_trim = 0
-        elif plan.continuity_enabled:
+        elif seg_continuity:
             gen_frames, prefix_trim = resolve_segment_generation_frames(
                 segment_frame_count=target_len,
                 segment_index=seg.index,
@@ -292,7 +296,7 @@ def execute_director_plan_core(
             ref_max_size=plan.ref_max_size,
             **ref_kwargs,
         )
-        if plan.continuity_enabled and seg.index > 0:
+        if seg_continuity:
             if prev_tail_output is None:
                 prev_tail_output = resolve_prev_segment_output(
                     plan, all_segments, seg.index, completed_outputs, node_id
@@ -388,7 +392,7 @@ def execute_director_plan_core(
         )
 
         # Length finalize only — no color/luma post (avoids smile drift / color shift).
-        if plan.continuity_enabled:
+        if seg_continuity:
             decoded = trim_decoded_for_continuity(
                 decoded,
                 prefix_trim=prefix_trim,

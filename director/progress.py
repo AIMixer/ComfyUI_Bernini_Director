@@ -98,15 +98,10 @@ def report_director_progress(
         srv = PromptServer.instance
         if srv:
             srv.send_sync("bernini_director_progress", payload, srv.client_id)
-            label = PHASE_LABELS.get(phase, phase)
-            pct = int(100 * overall_value / overall_max) if overall_max else 0
-            if phase == "plan" and segment_total > 1:
-                seg_txt = f"共 {segment_total} 段"
-            elif partial_run:
-                seg_txt = f"段 #{timeline_seg}（{segment_index + 1}/{segment_total}）"
-            else:
-                seg_txt = f"段 {segment_index + 1}/{segment_total}" if segment_total else "准备"
-            srv.send_progress_text(f"{seg_txt} · {label} · {pct}%", str(node_id))
+            # Clear ComfyUI's default node progress overlay — the Director UI
+            # already shows the same status in .bd-run-status; keeping both
+            # causes white+green text to stack on top of each other.
+            srv.send_progress_text("", str(node_id))
     except Exception as exc:
         log.debug("Director progress send skipped: %s", exc)
 
