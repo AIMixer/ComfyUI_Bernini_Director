@@ -1047,10 +1047,10 @@ class BerniniDirectorEditor {
             </select>
             <label title="0 = 导出全部帧；大于 0 时仅处理前 N 帧">最大帧数</label>
             <input type="number" class="bd-num" data-r="out-max-frames" min="0" max="999999" step="1" value="0" style="width:64px" title="0 = 全部导出">
-            <span class="bd-continuous-ref hidden" data-r="segment-continuity-wrap" title="多段衔接：使用上一段的后N帧引导生成视频">
+            <span class="bd-continuous-ref hidden" data-r="segment-continuity-wrap" title="多段衔接：用上一段尾帧做 SCAIL 引导；短段+高重叠时易在接缝附近粘帧，已自动裁掉回声帧">
                 <label><input type="checkbox" data-r="segment-continuity-cb">段间引导</label>
                 <span class="bd-meta">参考帧数</span>
-                <input type="number" class="bd-num" data-r="segment-continuity-overlap" min="1" max="81" step="4" value="9" style="width:48px" title="建议取9或13帧作为引导帧">
+                <input type="number" class="bd-num" data-r="segment-continuity-overlap" min="1" max="81" step="4" value="9" style="width:48px" title="SCAIL 锁定帧数（建议 9 或 13）；过短分段时建议关闭段间引导">
             </span>`;
         this.mainBody.appendChild(outputBar);
 

@@ -587,7 +587,7 @@ def plan_summary(plan: DirectorPlan) -> str:
         lock_px = resolve_continuity_lock_pixels(plan.continuity_overlap_frames)
         lines.append(
             f"Segment continuity: ON (overlap {plan.continuity_overlap_frames} "
-            f"→ SCAIL lock {lock_px}f + 1 ref, official path)"
+            f"→ SCAIL lock {lock_px}f + 1 ref + seam-echo trim)"
         )
     else:
         lines.append("Segment continuity: OFF (official Studio / per-segment path)")

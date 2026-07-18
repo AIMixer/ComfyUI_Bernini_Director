@@ -67,6 +67,42 @@ def _parse_ffmpeg_audio_info(stderr: str) -> tuple[int, int]:
     return 44100, 2
 
 
+def _probe_audio_stream(path: str) -> tuple[int, int]:
+    """Return (sample_rate, channels) via ffprobe; fall back to stereo 44.1kHz."""
+    probe = _ffprobe_bin()
+    if not probe or not path:
+        return 44100, 2
+    try:
+        res = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate,channels",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        text = res.stdout.decode(*_ENCODE_ARGS).strip()
+        # csv: sample_rate,channels  (sometimes just one field)
+        parts = [p.strip() for p in text.replace("\n", ",").split(",") if p.strip()]
+        ar = int(float(parts[0])) if parts else 44100
+        ac = int(parts[1]) if len(parts) > 1 else 2
+        if ar <= 0:
+            ar = 44100
+        if ac <= 0:
+            ac = 2
+        return ar, ac
+    except (subprocess.CalledProcessError, ValueError, IndexError):
+        return 44100, 2
+
+
 def extract_audio_segment(path: str, start_sec: float, duration_sec: float) -> dict[str, Any] | None:
     """Extract a slice of audio as ComfyUI AUDIO dict."""
     if duration_sec <= 0:
@@ -74,10 +110,27 @@ def extract_audio_segment(path: str, start_sec: float, duration_sec: float) -> d
     ffmpeg = _ffmpeg_bin()
     if not ffmpeg or not path or not os.path.isfile(path):
         return None
+    ar, ac = _probe_audio_stream(path)
+    # Force a known interleaved layout so reshape cannot disagree with ffmpeg output.
+    # Stereo is the ComfyUI AUDIO convention used downstream.
+    out_ac = 2
     args = [ffmpeg, "-v", "error", "-nostdin"]
     if start_sec > 0:
         args += ["-ss", str(max(0.0, start_sec))]
-    args += ["-i", path, "-t", str(duration_sec), "-f", "f32le", "-"]
+    args += [
+        "-i",
+        path,
+        "-t",
+        str(duration_sec),
+        "-vn",
+        "-ac",
+        str(out_ac),
+        "-ar",
+        str(ar),
+        "-f",
+        "f32le",
+        "-",
+    ]
     try:
         res = subprocess.run(args, capture_output=True, check=True)
     except subprocess.CalledProcessError as exc:
@@ -86,12 +139,25 @@ def extract_audio_segment(path: str, start_sec: float, duration_sec: float) -> d
         return None
     if not res.stdout:
         return None
-    ar, ac = _parse_ffmpeg_audio_info(res.stderr.decode(*_ENCODE_ARGS))
+    # Keep probe rate when stderr is silent (-v error); fall back to ffmpeg banner parse.
+    parsed_ar, _parsed_ac = _parse_ffmpeg_audio_info(res.stderr.decode(*_ENCODE_ARGS))
+    if parsed_ar > 0:
+        ar = parsed_ar
     audio = torch.frombuffer(bytearray(res.stdout), dtype=torch.float32)
-    if audio.numel() < ac:
+    # Drop dangling samples when byte length is not divisible by channel count
+    # (odd mono leftovers, truncated pipes, etc.). reshape() requires an exact size.
+    usable = (int(audio.numel()) // out_ac) * out_ac
+    if usable < out_ac:
         return None
-    frames = audio.numel() // ac
-    audio = audio.reshape((frames, ac)).transpose(0, 1).unsqueeze(0)
+    if usable < int(audio.numel()):
+        log.debug(
+            "Truncating %d dangling audio value(s) from %s (not divisible by %d ch)",
+            int(audio.numel()) - usable,
+            path,
+            out_ac,
+        )
+        audio = audio[:usable]
+    audio = audio.reshape((-1, out_ac)).transpose(0, 1).unsqueeze(0)
     return {"waveform": audio, "sample_rate": ar}
 
 

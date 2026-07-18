@@ -19,6 +19,7 @@ from .segment_runtime import (
     frames_label,
     needs_source_video,
     resolve_segment_raw_clip,
+    resolve_segment_raw_clip_with_lookahead,
     segment_passthrough_chunk,
     tensor_frame_to_jpeg_b64,
 )
@@ -33,9 +34,11 @@ from .plan import (
 from .progress import report_director_finish, report_director_progress, report_director_segment_preview
 from .segment_cache import load_segment_cache, save_segment_cache
 from .segment_continuity import (
+    CONTINUITY_SEAM_ECHO_BUDGET,
     apply_cached_segment_continuity,
     apply_scail_continuity_core,
     concat_continuous_chunks,
+    match_clip_to_gen_length,
     prepend_continuity_source,
     resolve_prev_segment_output,
     resolve_segment_generation_frames,
@@ -96,8 +99,8 @@ def execute_director_plan_core(
     completed_outputs: dict[int, torch.Tensor] = {}
     if plan.continuity_enabled:
         reports.append(
-            "Segment continuity: ON — official SCAIL branch "
-            "(latent prefix lock + context motion/ref from prev tail; no pixel prefix / color post)"
+            "Segment continuity: ON — SCAIL prefix lock + source prepend + "
+            "seam-echo trim (drops short prev-tail replay at joins)"
         )
     else:
         reports.append(
@@ -123,15 +126,31 @@ def execute_director_plan_core(
             **meta,
         )
 
-        raw_clip = resolve_segment_raw_clip(plan, seg)
         is_one_frame_i2v = seg.task_key == "i2v" and seg.source_clip is not None
-        target_len = max(1, seg.frame_count or raw_clip.shape[0]) if is_one_frame_i2v else raw_clip.shape[0]
+        # Continuity may need a few frames past the segment end so gen length
+        # matches a fully-conditioned source canvas (avoids hollow-tail freeze).
+        lookahead = 0
+        if plan.continuity_enabled and seg.index > 0 and not is_one_frame_i2v:
+            lookahead = CONTINUITY_SEAM_ECHO_BUDGET + 4
+        raw_clip = resolve_segment_raw_clip_with_lookahead(
+            plan, seg, end_extra=lookahead
+        )
+        body_len = max(1, int(seg.frame_count or 0))
+        if body_len <= 0:
+            body_len = max(1, int(raw_clip.shape[0]) - lookahead)
+        target_len = (
+            max(1, seg.frame_count or body_len)
+            if is_one_frame_i2v
+            else body_len
+        )
+        # Body-only clip for export length; lookahead stays in raw for conditioning.
+        body_raw = raw_clip[:target_len] if int(raw_clip.shape[0]) > target_len else raw_clip
         if seg.source_clip is not None:
-            clip_frames = raw_clip
+            clip_frames = body_raw
         elif plan.output_mode == "fixed":
-            clip_frames = fit_canvas(raw_clip, plan.width, plan.height)
+            clip_frames = fit_canvas(body_raw, plan.width, plan.height)
         else:
-            clip_frames = fit_video_long_edge(raw_clip, plan.ref_max_size)
+            clip_frames = fit_video_long_edge(body_raw, plan.ref_max_size)
         # Length prep: official Studio = this segment only; continuity prepends prev-tail.
         prev_tail_output = None
         if is_one_frame_i2v:
@@ -146,21 +165,32 @@ def execute_director_plan_core(
             )
             # Keep body at the segment's own length (no last-frame pad).
             clip_frames, _ = prepare_segment_clip(clip_frames, max(1, int(target_len)))
-            if prefix_trim > 0 and needs_source_video(seg.task_key):
-                prev_tail_output = resolve_prev_segment_output(
-                    plan, all_segments, seg.index, completed_outputs, node_id
-                )
+            if needs_source_video(seg.task_key):
                 if clip_frames is not None and clip_frames.shape[0] > 0:
                     ctx_h, ctx_w = int(clip_frames.shape[1]), int(clip_frames.shape[2])
                 else:
                     ctx_w, ctx_h = plan.width, plan.height
-                clip_frames = prepend_continuity_source(
-                    clip_frames,
-                    prev_tail_output,
-                    lock_px=prefix_trim,
-                    width=ctx_w,
-                    height=ctx_h,
-                )
+                if prefix_trim > 0:
+                    prev_tail_output = resolve_prev_segment_output(
+                        plan, all_segments, seg.index, completed_outputs, node_id
+                    )
+                    # Prefer timeline lookahead for post-body conditioning frames.
+                    if int(raw_clip.shape[0]) > target_len:
+                        extra = raw_clip[target_len:]
+                        if plan.output_mode == "fixed":
+                            extra = fit_canvas(extra, plan.width, plan.height)
+                        else:
+                            extra = fit_video_long_edge(extra, plan.ref_max_size)
+                        clip_frames = torch.cat([clip_frames, extra], dim=0)
+                    clip_frames = prepend_continuity_source(
+                        clip_frames,
+                        prev_tail_output,
+                        lock_px=prefix_trim,
+                        width=ctx_w,
+                        height=ctx_h,
+                    )
+                # Source must cover gen_frames; hollow tail → freeze / stutter near seams.
+                clip_frames = match_clip_to_gen_length(clip_frames, int(gen_frames))
             num_frames = int(gen_frames)
         else:
             # Official Studio / Bernini single-clip path — no overlap padding.
@@ -363,6 +393,7 @@ def execute_director_plan_core(
                 decoded,
                 prefix_trim=prefix_trim,
                 target_len=target_len,
+                prev_tail=prev_tail_output,
             )
         elif decoded.shape[0] > target_len:
             # Cut only — never pad with repeated last frames (visible stutter).

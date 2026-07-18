@@ -38,6 +38,43 @@ def resolve_segment_raw_clip(plan: DirectorPlan, seg) -> torch.Tensor:
     return load_timeline_segment(plan.raw, seg.start_frame, seg.end_frame)
 
 
+def resolve_segment_raw_clip_with_lookahead(
+    plan: DirectorPlan,
+    seg,
+    *,
+    end_extra: int = 0,
+) -> torch.Tensor:
+    """Like ``resolve_segment_raw_clip``, but may pull frames past ``seg.end_frame``.
+
+    Extra frames are conditioning-only (continuity gen length matching); they are
+    not kept in the exported segment after trim.
+    """
+    extra = max(0, int(end_extra))
+    if extra <= 0:
+        return resolve_segment_raw_clip(plan, seg)
+
+    if seg.source_clip is not None and seg.source_clip.shape[0] > 0:
+        # Gen canvases have no timeline lookahead beyond the clip itself.
+        return seg.source_clip.clone()
+
+    end = int(seg.end_frame) + extra
+    sv = plan.source_video
+    if is_gen_timeline_plan(plan) and sv is not None and int(sv.shape[0]) > 0:
+        start = max(0, int(seg.start_frame))
+        end = min(end, int(sv.shape[0]))
+        if end > start:
+            return sv[start:end].clone()
+
+    from ..lib.video_io import logical_frame_count
+
+    total = logical_frame_count(plan.raw)
+    end = min(end, total)
+    start = max(0, int(seg.start_frame))
+    if end <= start:
+        return resolve_segment_raw_clip(plan, seg)
+    return load_timeline_segment(plan.raw, start, end)
+
+
 def source_passthrough_chunk(plan: DirectorPlan, seg) -> torch.Tensor:
     """Scaled source frames for skipped v2v segments with no generation cache yet."""
     raw_clip = resolve_segment_raw_clip(plan, seg)
