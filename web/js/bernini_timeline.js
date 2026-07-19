@@ -35,12 +35,16 @@ import {
 import { mountPromptImageMentions } from "./bernini_prompt_mentions.js";
 
 const RULER_H = 24;
-const SEG_LABEL_H = 18;
+const SEG_LABEL_H = 20;
 const TRACK_H = 160;
 const TRACK_Y = RULER_H + SEG_LABEL_H;
 const STAGE_PREVIEW_H = 220;
 const MIN_SEG = 4;
 const HANDLE_PX = 14;
+/** Canvas-drawn run-select checkbox (not a DOM control). */
+const RUN_CHECK_SIZE = 14;
+const RUN_CHECK_HIT_PAD_X = 8;
+const RUN_CHECK_HIT_PAD_Y = 4;
 const THUMB_MAX_W = 168;
 const THUMB_JPEG_Q = 0.55;
 const TIMELINE_SYNC_DEBOUNCE_MS = 500;
@@ -1470,16 +1474,23 @@ class BerniniDirectorEditor {
             if (this._drag || this.isPlaying) return;
             const { x, y } = this.getMousePos(e);
             const hit = this.hitTest(x, y);
-            if (hit?.type === "segment" && this.timeline.segments.length >= 2) {
+            this.canvas.classList.remove("bd-grab");
+            if (hit?.type === "run-check") {
+                this.canvas.style.cursor = "pointer";
+            } else if (hit?.type === "segment" && this.timeline.segments.length >= 2) {
                 this.canvas.classList.add("bd-grab");
+                this.canvas.style.cursor = "";
             } else {
-                this.canvas.classList.remove("bd-grab");
+                this.canvas.style.cursor = "";
             }
         };
         window.addEventListener("mousemove", this._onMouseMove);
         window.addEventListener("mouseup", this._onMouseUp);
         this.canvas.addEventListener("mousemove", this._onCanvasHover);
-        this.canvas.addEventListener("mouseleave", () => this.canvas.classList.remove("bd-grab"));
+        this.canvas.addEventListener("mouseleave", () => {
+            this.canvas.classList.remove("bd-grab");
+            this.canvas.style.cursor = "";
+        });
 
         this.root.addEventListener("mouseenter", () => { this._isHovering = true; });
         this.root.addEventListener("mouseleave", () => { this._isHovering = false; });
@@ -3958,10 +3969,29 @@ class BerniniDirectorEditor {
     getMousePos(e) {
         const rect = this.canvas.getBoundingClientRect();
         const layoutW = this.getLayoutWidth();
+        const layoutH = this.canvasHeight || (RULER_H + SEG_LABEL_H + TRACK_H);
         const scaleX = rect.width > 0 ? layoutW / rect.width : 1;
+        const scaleY = rect.height > 0 ? layoutH / rect.height : 1;
         return {
             x: (e.clientX - rect.left) * scaleX,
-            y: e.clientY - rect.top,
+            y: (e.clientY - rect.top) * scaleY,
+        };
+    }
+
+    /** Shared draw + hit geometry for per-segment run checkboxes (segment top-left). */
+    _runCheckGeometry(seg, width) {
+        const x0 = this.frameToX(seg.start, width);
+        const size = RUN_CHECK_SIZE;
+        const boxX = x0 + 5;
+        const boxY = TRACK_Y + 5;
+        return {
+            boxX,
+            boxY,
+            size,
+            hitX0: boxX - RUN_CHECK_HIT_PAD_X,
+            hitY0: boxY - RUN_CHECK_HIT_PAD_Y,
+            hitX1: boxX + size + RUN_CHECK_HIT_PAD_X,
+            hitY1: boxY + size + RUN_CHECK_HIT_PAD_Y,
         };
     }
 
@@ -3976,10 +4006,15 @@ class BerniniDirectorEditor {
             return { type: "ruler" };
         }
 
+        // Label band is range text only (not a drag / toggle surface).
+        if (y < TRACK_Y) return null;
+
+        // Checkbox corner wins over generic segment hit (same toggle action either way
+        // in run-select mode; keeps hit type accurate for cursor / future hooks).
         if (this.isRunSelectEnabled() && segs.length >= 2) {
             for (let i = segs.length - 1; i >= 0; i--) {
-                const x0 = this.frameToX(segs[i].start, width);
-                if (x >= x0 + 3 && x <= x0 + 19 && y >= TRACK_Y + 3 && y <= TRACK_Y + 19) {
+                const g = this._runCheckGeometry(segs[i], width);
+                if (x >= g.hitX0 && x <= g.hitX1 && y >= g.hitY0 && y <= g.hitY1) {
                     return { type: "run-check", index: i };
                 }
             }
@@ -3990,14 +4025,17 @@ class BerniniDirectorEditor {
             const x0 = this.frameToX(seg.start, width);
             const x1 = this.frameToX(seg.start + seg.length, width);
             const isLast = i === segs.length - 1;
-            const inside = isLast ? (x >= x0 && x <= x1) : (x >= x0 && x < x1);
-            if (inside) return { type: "segment", index: i };
+            const insideX = isLast ? (x >= x0 && x <= x1) : (x >= x0 && x < x1);
+            if (insideX && y >= TRACK_Y && y <= TRACK_Y + TRACK_H) {
+                return { type: "segment", index: i };
+            }
         }
 
         for (let i = 0; i < segs.length; i++) {
             const seg = segs[i];
             const x0 = this.frameToX(seg.start, width);
             const x1 = this.frameToX(seg.start + seg.length, width);
+            if (y < TRACK_Y || y > TRACK_Y + TRACK_H) continue;
             if (Math.abs(x - x0) <= HANDLE_PX) return { type: "edge", index: i, edge: "left" };
             if (Math.abs(x - x1) <= HANDLE_PX) return { type: "edge", index: i, edge: "right" };
         }
@@ -4008,6 +4046,9 @@ class BerniniDirectorEditor {
 
     onMouseDown(e) {
         if (e.button !== 0) return;
+        // Keep LiteGraph / node drag from eating timeline clicks.
+        stopDomEvent(e);
+        e.preventDefault();
         const { x, y } = this.getMousePos(e);
         const hit = this.hitTest(x, y);
         if (!hit) return;
@@ -4017,6 +4058,7 @@ class BerniniDirectorEditor {
             this._drag = { kind: "playhead" };
         } else if (hit.type === "run-check") {
             this.toggleSegmentRun(hit.index);
+            this._drag = null;
         } else if (hit.type === "segment") {
             this.selectedIndex = hit.index;
             this.updateSelectionUI();
@@ -4390,12 +4432,16 @@ class BerniniDirectorEditor {
 
     _drawSegmentRunCheck(x, y, enabled) {
         const ctx = this.ctx;
+        const s = RUN_CHECK_SIZE;
         ctx.save();
-        ctx.fillStyle = enabled ? "#1a3a2a" : "#111";
-        ctx.strokeStyle = enabled ? "#4fff8f" : "#666";
+        // Opaque plate so the control never blends into timeline chrome.
+        ctx.fillStyle = "#0e0e0e";
+        ctx.fillRect(x - 1, y - 1, s + 2, s + 2);
+        ctx.fillStyle = enabled ? "#1a3a2a" : "#1c1c1c";
+        ctx.strokeStyle = enabled ? "#4fff8f" : "#888";
         ctx.lineWidth = 1;
-        ctx.fillRect(x, y, 14, 14);
-        ctx.strokeRect(x + 0.5, y + 0.5, 13, 13);
+        ctx.fillRect(x, y, s, s);
+        ctx.strokeRect(x + 0.5, y + 0.5, s - 1, s - 1);
         if (enabled) {
             ctx.fillStyle = "#4fff8f";
             ctx.font = "11px sans-serif";
@@ -4557,9 +4603,6 @@ class BerniniDirectorEditor {
             }
             this.drawSegmentThumbnails(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
             this.drawPromptOverlay(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
-            if (this.isRunSelectEnabled() && segs.length >= 2) {
-                this._drawSegmentRunCheck(x0 + 5, TRACK_Y + 5, runOn);
-            }
             const clipIdx = this.getSegmentClipIndex(seg);
             const clipColor = CLIP_SEGMENT_COLORS[clipIdx % CLIP_SEGMENT_COLORS.length];
             this.ctx.strokeStyle = running ? "#4fff8f" : sel ? "#fff" : clipColor;
@@ -4569,6 +4612,11 @@ class BerniniDirectorEditor {
             this.ctx.fillRect(x0 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
             this.ctx.fillRect(x1 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
             this.ctx.globalAlpha = 1;
+            // Checkbox on top-left; drawn last so it stays clear on dimmed segments.
+            if (this.isRunSelectEnabled() && segs.length >= 2 && pxW >= RUN_CHECK_SIZE + 8) {
+                const g = this._runCheckGeometry(seg, width);
+                this._drawSegmentRunCheck(g.boxX, g.boxY, runOn);
+            }
         }
 
         if (reordering && this._reorderDropRank >= 0) {
