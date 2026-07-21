@@ -433,6 +433,13 @@ def build_director_plan(
             seg_prompt = (seg_data.get("prompt") or "").strip() or prompt
             seg_task = seg_data.get("taskType") or seg_data.get("task_type") or task_type
             seg_refs = _load_refs(seg_data.get("refs") or [])
+            if not seg_refs and global_refs:
+                seg_refs = list(global_refs)
+                log.info(
+                    "video segment #%d: segment refs empty — using %d global reference image(s)",
+                    idx + 1,
+                    len(seg_refs),
+                )
             seg_ref_video = dict(seg_data.get("referenceVideo") or seg_data.get("reference_video") or {})
 
         seg_task_key = resolve_task_key(seg_task)

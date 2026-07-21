@@ -81,6 +81,7 @@ function stripTimelineContinuityRootFields(timeline) {
 function stripTimelineEphemeralFields(timeline) {
     if (!timeline || typeof timeline !== "object") return;
     delete timeline.videoWorkspace;
+    delete timeline.batchWorkspace;
 }
 
 const HIDDEN_WIDGETS = [
@@ -1889,6 +1890,48 @@ class BerniniDirectorEditor {
         return true;
     }
 
+    /** Snapshot prompt-batch (r2v/r2i/…) groups before switching to video / gen. */
+    _stashBatchWorkspace() {
+        const segs = this.timeline.segments || [];
+        if (!segs.length) return;
+        // Only stash when current segments look like batch groups (have prompt/refs/fc).
+        this.timeline.batchWorkspace = {
+            segments: JSON.parse(JSON.stringify(segs)),
+            selectedIndex: this.selectedIndex,
+            editMode: this.timeline.editMode || "segment",
+            runSelectEnabled: !!this.timeline.runSelectEnabled,
+            runSelection: Array.isArray(this.timeline.runSelection)
+                ? [...this.timeline.runSelection]
+                : undefined,
+            output: this.timeline.output
+                ? JSON.parse(JSON.stringify(this.timeline.output))
+                : undefined,
+        };
+    }
+
+    /** Restore prompt-batch groups after returning from rv2v / video / gen. */
+    _restoreBatchWorkspace() {
+        const ws = this.timeline.batchWorkspace;
+        if (!ws || typeof ws !== "object" || !Array.isArray(ws.segments) || !ws.segments.length) {
+            return false;
+        }
+        this.timeline.segments = JSON.parse(JSON.stringify(ws.segments));
+        if (ws.editMode) this.timeline.editMode = ws.editMode;
+        if (ws.runSelectEnabled != null) this.timeline.runSelectEnabled = !!ws.runSelectEnabled;
+        if (Array.isArray(ws.runSelection)) this.timeline.runSelection = [...ws.runSelection];
+        if (ws.output && typeof ws.output === "object") {
+            this.timeline.output = { ...(this.timeline.output || {}), ...JSON.parse(JSON.stringify(ws.output)) };
+        }
+        this.selectedIndex = clamp(
+            ws.selectedIndex ?? 0,
+            0,
+            Math.max(0, this.timeline.segments.length - 1),
+        );
+        // Drop snapshot after restore so later batch edits are not clobbered by a stale stash.
+        this.timeline.batchWorkspace = null;
+        return true;
+    }
+
     ensureGenTimeline() {
         const key = this.getTaskKey();
         this.timeline.gen = this.timeline.gen || {};
@@ -1992,16 +2035,24 @@ class BerniniDirectorEditor {
             if (!wasBatch) {
                 // Keep v2v/rv2v video + segments so switching back can restore them.
                 if (prev === "video") this._stashVideoWorkspace();
-                const keep = this.timeline.global?.prompt
-                    || this.timeline.segments?.[0]?.prompt
-                    || "";
-                this.timeline.segments = [newBatchSegment({
-                    prompt: keep,
-                    negativePrompt: this.negativePromptWidget?.value || "bad video",
-                })];
+                // Prefer restoring the previous r2v/r2i batch (prompts + refs).
+                if (!this._restoreBatchWorkspace()) {
+                    const keep = this.timeline.global?.prompt
+                        || this.timeline.segments?.[0]?.prompt
+                        || "";
+                    const keepRefs = Array.isArray(this.timeline.global?.refs) && this.timeline.global.refs.length
+                        ? JSON.parse(JSON.stringify(this.timeline.global.refs))
+                        : [];
+                    this.timeline.segments = [newBatchSegment({
+                        prompt: keep,
+                        negativePrompt: this.negativePromptWidget?.value || "bad video",
+                        refs: keepRefs,
+                    })];
+                }
             }
             ensureImageBatchTimeline(this);
         } else if (isGen) {
+            if (wasBatch) this._stashBatchWorkspace();
             if (!wasGen && !wasBatch) {
                 if (prev === "video") this._stashVideoWorkspace();
                 const key = this.getTaskKey();
@@ -2020,6 +2071,9 @@ class BerniniDirectorEditor {
             }
             this.ensureGenTimeline();
         } else if (prev !== "video") {
+            // Leaving batch/gen for video — stash batch groups before video restore
+            // overwrites timeline.segments (fixes r2v → rv2v → r2v wiping refs/prompts).
+            if (wasBatch) this._stashBatchWorkspace();
             this.timeline.timelineMode = "video";
             // Prefer restoring the stashed v2v/rv2v session (segments + thumbs source).
             if (!this._restoreVideoWorkspace()) {

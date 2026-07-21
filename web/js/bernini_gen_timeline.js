@@ -89,9 +89,9 @@ export function genLayoutHint(taskKey) {
     switch (taskKey) {
         case "t2i": return "文生图 · 多组提示词 · 固定宽高 · 全部导出至 images · 选择运行";
         case "i2i": return "图生图 · 每组上传源图 · 全部导出至 images · 选择运行";
-        case "r2i": return "参考主体生图 · 每组最多 5 张参考图 · 全部导出至 images · 选择运行";
+        case "r2i": return "参考主体生图 · 每组最多 5 张参考图（img0–img4）· 全部导出至 images · 选择运行";
         case "t2v": return "文生视频 · 多组提示词 · 每组可设帧数 · 固定宽高 · 支持全部/分段导出 · 选择运行";
-        case "r2v": return "参考主体生视频 · 每组最多 5 张参考图 · 每组可设帧数 · 支持全部/分段导出 · 选择运行";
+        case "r2v": return "参考主体生视频 · 每组最多 5 张参考图（img0–img4）· 每组可设帧数 · 支持全部/分段导出 · 选择运行";
         case "i2v": return "图生视频 · 实验性功能 · 单帧视频输入 · 每组可设帧数 · 支持全部/分段导出 · 选择运行";
         default: return "";
     }

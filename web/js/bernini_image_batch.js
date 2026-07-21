@@ -158,6 +158,30 @@ export function wireBatchRunSelectControls(editor, batchUi) {
     });
 }
 
+function cloneRefs(refs) {
+    if (!Array.isArray(refs) || !refs.length) return [];
+    try {
+        return JSON.parse(JSON.stringify(refs));
+    } catch {
+        return refs.map((r) => ({ ...r }));
+    }
+}
+
+/** Copy global.refs into batch segments that have no refs (r2i / r2v). */
+export function migrateGlobalRefsIntoBatchSegments(editor, taskKey) {
+    const key = resolveTaskKey(taskKey || editor.getTaskKey?.() || "");
+    if (key !== "r2i" && key !== "r2v") return false;
+    const globalRefs = editor.timeline?.global?.refs;
+    if (!Array.isArray(globalRefs) || !globalRefs.length) return false;
+    let moved = false;
+    for (const seg of editor.timeline.segments || []) {
+        if ((seg.refs || []).length) continue;
+        seg.refs = cloneRefs(globalRefs);
+        moved = true;
+    }
+    return moved;
+}
+
 export function ensureImageBatchTimeline(editor) {
     editor.timeline.editMode = "segment";
     editor.timeline.output = editor.timeline.output || {};
@@ -186,22 +210,33 @@ export function ensureImageBatchTimeline(editor) {
     if (!editor.timeline.segments?.length) {
         editor.timeline.segments = [newBatchSegment({ frameCount: defFc, length: defFc })];
     }
+    // r2i/r2v need per-group refs. If the user came from rv2v (global refs) or left
+    // refs only on global, copy them into empty batch groups so generation actually
+    // receives reference_image_* — otherwise it silently behaves like t2v/t2i.
+    migrateGlobalRefsIntoBatchSegments(editor, taskKey);
     for (const seg of editor.timeline.segments) {
         if (isVideoBatchTask(taskKey)) {
-            const fc = clamp(parseInt(seg.frameCount ?? seg.length, 10) || defFc, minFrameCount(taskKey), MAX_GEN_FRAMES);
+            // Prefer frame count remembered before a t2i/r2i detour (which forces 1f).
+            const preferred = seg._videoFrameCount ?? seg.frameCount ?? seg.length;
+            const fc = clamp(parseInt(preferred, 10) || defFc, minFrameCount(taskKey), MAX_GEN_FRAMES);
             seg.frameCount = fc;
             seg.length = fc;
+            seg._videoFrameCount = fc;
         } else {
+            // Keep prior video-batch length so r2v → t2i → r2v can restore it.
+            const prevFc = parseInt(seg.frameCount ?? seg.length, 10) || 0;
+            if (prevFc > 1) seg._videoFrameCount = prevFc;
+            else if (seg._videoFrameCount == null && defFc > 1) {
+                /* keep existing _videoFrameCount if any */
+            }
             seg.frameCount = 1;
             seg.length = 1;
         }
         seg.negativePrompt = seg.negativePrompt ?? "";
         seg.genImage = seg.genImage || { imageFile: seg.imageFile || "" };
-        if (taskKey === "i2v") {
-            seg.refs = [];
-        } else {
-            seg.refs = seg.refs || [];
-        }
+        // Do NOT clear refs for i2v — backend ignores them, but wiping here breaks
+        // r2v → i2v → r2v (user loses uploaded reference images).
+        seg.refs = seg.refs || [];
         seg.previewB64 = seg.previewB64 || "";
         seg.previewFrames = seg.previewFrames || [];
         seg.previewFps = seg.previewFps || parseFloat(editor.frameRateWidget?.value || 24);
@@ -228,7 +263,8 @@ export function normalizeImageBatchSegments(editor) {
             frameCount: fc,
             negativePrompt: seg.negativePrompt ?? "",
             genImage: seg.genImage || { imageFile: "" },
-            refs: taskKey === "i2v" ? [] : (seg.refs || []),
+            refs: seg.refs || [],
+            _videoFrameCount: seg._videoFrameCount,
             previewB64: seg.previewB64 || "",
             previewFrames: seg.previewFrames || [],
             previewFps: seg.previewFps || parseFloat(editor.frameRateWidget?.value || 24),
@@ -500,22 +536,30 @@ export function renderImageBatchGroups(editor) {
 
     if (editor.batchHint) {
         const hints = {
-            t2i: "文生图 · 全部导出 · 从 images 输出批量取图",
-            i2i: "图生图 · 每组需上传源图 · 最长边缩放或固定宽高",
-            r2i: "参考主体生图 · 每组最多 5 张参考图",
-            t2v: "文生视频 · 每组可设帧数 · 开启「选择运行」可只跑勾选的组",
-            r2v: "参考主体生视频 · 每组可设帧数 · 开启「选择运行」可只跑勾选的组",
-            i2v: "图生视频 · 实验性功能 · 开启「选择运行」可只跑勾选的组",
-            r2i: "参考主体生图 · 开启「选择运行」可只跑勾选的组",
             t2i: "文生图 · 开启「选择运行」可只跑勾选的组",
-            i2i: "图生图 · 开启「选择运行」可只跑勾选的组",
+            i2i: "图生图 · 每组需上传源图 · 开启「选择运行」可只跑勾选的组",
+            r2i: "参考主体生图 · 请在每组卡片上传参考图（img0–img4）",
+            t2v: "文生视频 · 每组可设帧数 · 开启「选择运行」可只跑勾选的组",
+            r2v: "参考主体生视频 · 请在每组卡片上传参考图（img0–img4），否则会像纯文生视频",
+            i2v: "图生视频 · 实验性功能 · 开启「选择运行」可只跑勾选的组",
         };
         editor.batchHint.textContent = hints[key] || (isVideo ? "每组生成一段视频" : "每组生成 1 张图片");
     }
     if (editor.batchI2vNotice) {
-        const show = key === "i2v";
-        editor.batchI2vNotice.textContent = I2V_EXPERIMENTAL_NOTICE;
-        editor.batchI2vNotice.classList.toggle("visible", show);
+        const needsRefs = key === "r2i" || key === "r2v";
+        const hasAnyRefs = (editor.timeline.segments || []).some((s) => (s.refs || []).length > 0);
+        if (key === "i2v") {
+            editor.batchI2vNotice.textContent = I2V_EXPERIMENTAL_NOTICE;
+            editor.batchI2vNotice.classList.add("visible");
+        } else if (needsRefs && !hasAnyRefs) {
+            editor.batchI2vNotice.textContent = key === "r2v"
+                ? "当前没有参考图：请在提示词组卡片中上传 img0–img4。未上传时生成会退化成文生视频（t2v），无法参考主体。"
+                : "当前没有参考图：请在提示词组卡片中上传 img0–img4。未上传时生成会退化成文生图（t2i）。";
+            editor.batchI2vNotice.classList.add("visible");
+        } else {
+            editor.batchI2vNotice.classList.remove("visible");
+            editor.batchI2vNotice.textContent = "";
+        }
     }
 
     list.innerHTML = "";
