@@ -51,7 +51,8 @@ def resolve_video_path(video: dict) -> str:
     raise ValueError(f"Video file not found in ComfyUI input: {video_file}")
 
 
-def _ffprobe_bin() -> str | None:
+def ffprobe_bin() -> str | None:
+    """Resolve ffprobe: PATH first, then imageio-ffmpeg sibling binary if present."""
     import shutil
 
     probe = shutil.which("ffprobe")
@@ -69,6 +70,10 @@ def _ffprobe_bin() -> str | None:
     except ImportError:
         pass
     return None
+
+
+# Back-compat alias used by older call sites / hot-reload.
+_ffprobe_bin = ffprobe_bin
 
 
 def _parse_rate(value: str | float | int | None) -> float:

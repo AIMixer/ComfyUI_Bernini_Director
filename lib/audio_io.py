@@ -11,7 +11,12 @@ from typing import Any
 
 import torch
 
-from .video_io import resolve_logical_frame_entry, resolve_video_path, video_clips_from_timeline
+from .video_io import (
+    ffprobe_bin,
+    resolve_logical_frame_entry,
+    resolve_video_path,
+    video_clips_from_timeline,
+)
 
 log = logging.getLogger("ComfyUI-Bernini-Director.audio")
 
@@ -27,15 +32,11 @@ def _ffmpeg_bin() -> str | None:
         return shutil.which("ffmpeg")
 
 
-def _ffprobe_bin() -> str | None:
-    return shutil.which("ffprobe")
-
-
-def video_has_audio(path: str) -> bool:
-    """Return True when the file has at least one audio stream."""
-    probe = _ffprobe_bin()
+def video_has_audio(path: str) -> bool | None:
+    """Return True/False when ffprobe works; None when probe is unavailable."""
+    probe = ffprobe_bin()
     if not probe:
-        return False
+        return None
     try:
         res = subprocess.run(
             [
@@ -69,7 +70,7 @@ def _parse_ffmpeg_audio_info(stderr: str) -> tuple[int, int]:
 
 def _probe_audio_stream(path: str) -> tuple[int, int]:
     """Return (sample_rate, channels) via ffprobe; fall back to stereo 44.1kHz."""
-    probe = _ffprobe_bin()
+    probe = ffprobe_bin()
     if not probe or not path:
         return 44100, 2
     try:
@@ -110,7 +111,7 @@ def extract_audio_segment(path: str, start_sec: float, duration_sec: float) -> d
     ffmpeg = _ffmpeg_bin()
     if not ffmpeg or not path or not os.path.isfile(path):
         return None
-    ar, ac = _probe_audio_stream(path)
+    ar, _ac = _probe_audio_stream(path)
     # Force a known interleaved layout so reshape cannot disagree with ffmpeg output.
     # Stereo is the ComfyUI AUDIO convention used downstream.
     out_ac = 2
@@ -248,7 +249,45 @@ def extract_timeline_audio(
     spans = _timeline_audio_spans(timeline, logical_start, logical_end, frame_rate)
     if not spans:
         return None
+    if not _ffmpeg_bin():
+        log.warning(
+            "Source audio skipped: ffmpeg unavailable "
+            "(install FFmpeg on PATH or `pip install imageio-ffmpeg`)."
+        )
+        return None
     paths = {path for path, _, _ in spans}
-    if not any(video_has_audio(p) for p in paths):
+    probes = [video_has_audio(p) for p in paths]
+    # Only skip when ffprobe positively confirms every source has no audio track.
+    # If ffprobe is missing (None), still try ffmpeg extraction.
+    if probes and all(p is False for p in probes):
         return None
     return _merge_audio_spans(spans)
+
+
+def diagnose_source_audio_failure(
+    timeline: dict,
+    logical_start: int,
+    logical_end: int,
+    frame_rate: float,
+) -> str:
+    """Human-readable reason when source-audio extraction produced silence."""
+    if not _ffmpeg_bin():
+        return (
+            "ffmpeg unavailable (install FFmpeg on PATH or `pip install imageio-ffmpeg`)"
+        )
+    spans = _timeline_audio_spans(timeline, logical_start, logical_end, frame_rate)
+    if not spans:
+        return "could not map timeline frames to a source video path"
+    paths = sorted({path for path, _, _ in spans})
+    probes = [video_has_audio(p) for p in paths]
+    if probes and all(p is False for p in probes):
+        return "input video has no audio track"
+    if ffprobe_bin() is None:
+        return (
+            "audio extraction failed — ffprobe not found "
+            "(install a full FFmpeg build with ffprobe on PATH) "
+            "and/or ffmpeg could not decode audio from the source"
+        )
+    if any(p is True for p in probes):
+        return "ffmpeg failed to extract audio despite an audio stream being present"
+    return "audio extraction failed"

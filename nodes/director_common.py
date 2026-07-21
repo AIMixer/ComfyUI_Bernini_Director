@@ -7,7 +7,10 @@ import logging
 
 import torch
 
-from ..director.audio_export import build_director_audio_outputs, task_passes_source_audio
+from ..director.audio_export import (
+    build_director_audio_outputs,
+    source_audio_report_note,
+)
 from ..director.frame_align import pad_or_trim_frames
 from ..director.gen_timeline import is_prompt_batch_timeline, is_video_batch_task_key
 from ..director.plan import build_director_plan, count_all_timeline_segments, count_timeline_segments, plan_summary
@@ -417,23 +420,20 @@ def finalize_director_outputs(
                 "skipped groups merged from cache or source when available."
             )
 
+    split_for_audio = export_segments or (is_batch and not video_batch)
+    audio_frame_end = frame_count if not split_for_audio else None
     audio_out = build_director_audio_outputs(
         plan,
         images_out,
-        export_segments=export_segments or (is_batch and not video_batch),
-        output_frame_end=frame_count if not (export_segments or (is_batch and not video_batch)) else None,
+        export_segments=split_for_audio,
+        output_frame_end=audio_frame_end,
     )
-    if task_passes_source_audio(plan.global_task_key):
-        has_audio = any(
-            isinstance(a, dict)
-            and isinstance(a.get("waveform"), torch.Tensor)
-            and int(a["waveform"].numel()) > 0
-            for a in audio_out
-        )
-        if has_audio:
-            report = report + "\n\nSource audio: extracted from input video (connect audio → VHS Video Combine)."
-        else:
-            report = report + "\n\nSource audio: none (input video has no audio track or ffmpeg unavailable)."
+    report = report + source_audio_report_note(
+        plan,
+        audio_out,
+        export_segments=split_for_audio,
+        output_frame_end=audio_frame_end,
+    )
 
     split_source_outputs = export_segments or (is_batch and not video_batch)
     if export_source_images:

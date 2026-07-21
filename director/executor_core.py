@@ -328,15 +328,17 @@ def execute_director_plan_core(
         if clear_vram_between_segments:
             cleanup_segment_vram(enabled=True, unload_models=seg_total > 1)
 
-        report_director_progress(
-            node_id,
-            segment_index=progress_index,
-            segment_total=seg_total,
-            phase="high_noise",
-            phase_value=0,
-            phase_max=1,
-            **meta,
-        )
+        def _report_sample_phase(phase: str, value: float) -> None:
+            report_director_progress(
+                node_id,
+                segment_index=progress_index,
+                segment_total=seg_total,
+                phase=phase,
+                phase_value=value,
+                phase_max=1,
+                **meta,
+            )
+
         samples = sample_dual_stage(
             model_high=model_high,
             model_low=model_low,
@@ -351,24 +353,7 @@ def execute_director_plan_core(
             split_step=split_step,
             sampler_name=sampler,
             scheduler=scheduler,
-        )
-        report_director_progress(
-            node_id,
-            segment_index=progress_index,
-            segment_total=seg_total,
-            phase="high_noise",
-            phase_value=1,
-            phase_max=1,
-            **meta,
-        )
-        report_director_progress(
-            node_id,
-            segment_index=progress_index,
-            segment_total=seg_total,
-            phase="low_noise",
-            phase_value=1,
-            phase_max=1,
-            **meta,
+            on_phase=_report_sample_phase,
         )
 
         report_director_progress(
