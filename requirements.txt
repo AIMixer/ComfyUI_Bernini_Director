@@ -1,2 +1,5 @@
 # Runtime deps are provided by ComfyUI. Optional:
 # opencv-python  # faster video probe/decode fallbacks if cv2 is desired
+
+# Smart shot split (智能分割)
+scenedetect>=0.6.4,<0.8

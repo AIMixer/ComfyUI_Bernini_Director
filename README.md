@@ -14,7 +14,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| **多段时间轴** | 节点内上传视频，支持切分、均分、追加；可视化时间轴预览每段范围 |
+| **多段时间轴** | 节点内上传视频，支持切分、均分、智能分镜分割、追加；分割点可选中删除；可视化时间轴预览每段范围 |
 | **多任务模式** | 完整 `task_type`：`default`（默认通用）、`t2i`（文生图）、`t2v`（文生视频）、`i2i`（图生图）、`r2i`（参考主体生图）、`i2v`（图生视频，实验性）、`v2v`（视频转视频）、`r2v`（参考主体生视频）、`vi2v`（内容延展改视频）、`rv2v`（参考素材改视频）、`ads2v`（广告植入视频）、`vrc2v`（主体位置动作微调）、`mv2v`（全参数精细化改视频） |
 | **参考图引导** | 最多 5 张参考图（image0–image4），支持 `@imageN` 提示词引用 |
 | **双阶段采样** | HIGH / LOW 双 UNET，独立 CFG、seed、步数与 split |
@@ -44,10 +44,11 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/AIMixer/ComfyUI_Bernini_Director.git
 ```
 
-可选依赖（非必须）：
+可选依赖（智能分割需要 PySceneDetect）：
 
 ```bash
 pip install -r ComfyUI_Bernini_Director/requirements.txt
+# 或单独安装：pip install "scenedetect<0.8"
 ```
 
 重启 ComfyUI。

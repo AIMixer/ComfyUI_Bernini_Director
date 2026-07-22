@@ -172,8 +172,12 @@ const STYLES = `
 .bd-modal-item:hover{background:#252525;color:#eee}
 .bd-modal-item.selected{background:#2a2a2a;border-color:#4fff8f;color:#fff}
 .bd-modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-shrink:0}
+.bd-toolbar-wrap{display:flex;flex-direction:column;gap:4px;width:100%}
 .bd-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;width:100%}
 .bd-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;flex:1;min-width:0}
+.bd-smart-split-msg{width:100%;box-sizing:border-box;font-size:11px;line-height:1.4;color:#f66;padding:0 2px;min-height:0}
+.bd-smart-split-msg.hidden{display:none!important}
+.bd-smart-split-msg.ok{color:#8c8}
 .bd-stage{width:100%;box-sizing:border-box;background:#0c0c0c;border:1px solid #222;border-bottom:none;border-radius:6px 6px 0 0;overflow:hidden;position:relative;min-height:120px;max-height:280px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
 .bd-stage.hidden{display:none!important}
 .bd-stage-video,.bd-stage-img{width:100%;height:100%;max-height:280px;object-fit:contain;background:#000;display:block}
@@ -198,6 +202,11 @@ const STYLES = `
 .bd-btn{background:#222;color:#e0e0e0;border:1px solid #111;border-radius:4px;padding:6px 12px;font-size:11px;cursor:pointer}
 .bd-btn:hover{background:#333;border-color:#555}
 .bd-btn-danger:hover{background:#4a1515;border-color:#c44;color:#faa}
+.bd-split-edit-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;width:100%;box-sizing:border-box;padding:6px 10px;margin:0 0 4px;background:#241818;border:1px solid #633;border-radius:6px}
+.bd-split-edit-bar.hidden{display:none!important}
+.bd-split-edit-bar .bd-split-edit-hint{flex:1;min-width:140px;font-size:11px;line-height:1.35;color:#f88}
+.bd-btn-del-split{background:#3a2020;border-color:#e66;color:#f88}
+.bd-btn-del-split:hover{background:#4a1515;border-color:#f88;color:#fcc}
 .bd-btn-sm{padding:3px 8px;font-size:10px}
 .bd-btn-run-select.active{background:#1a3a2a;color:#4fff8f;border-color:#4fff8f}
 .bd-run-select-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:10px;color:#aaa}
@@ -741,6 +750,8 @@ class BerniniDirectorEditor {
         this.domWidget = domWidget;
         this.zoom = 1;
         this.selectedIndex = 0;
+        /** @type {number|null} Selected editable split-point frame (logical). */
+        this.selectedSplitFrame = null;
         this.currentFrame = 0;
         this.isPlaying = false;
         this.isLooping = false;
@@ -1035,33 +1046,38 @@ class BerniniDirectorEditor {
         this.root.className = "bd-wrap";
         this.root.innerHTML = `<style>${STYLES}</style>`;
 
-        const toolbar = document.createElement("div");
-        toolbar.className = "bd-toolbar";
-        toolbar.innerHTML = `
-            <div class="bd-actions">
-                <button type="button" class="bd-btn bd-btn-primary" data-a="video">上传视频</button>
-                <button type="button" class="bd-btn" data-a="video-append" title="上传并追加到时间轴末尾，作为独立片段">追加视频</button>
-                <button type="button" class="bd-btn" data-a="split">+ 分割</button>
-                <input type="number" class="bd-num" data-r="equal-n" min="2" max="64" value="2" title="均分段数">
-                <button type="button" class="bd-btn" data-a="equal">均分</button>
-                <button type="button" class="bd-btn" data-a="run-select-toggle" title="开启后可勾选要运行的片段/提示词组；关闭时运行全部">选择运行</button>
-                <label class="bd-run-select-all-wrap hidden" data-r="run-select-all-wrap" title="勾选=全选，取消=全部不选；仍可在各片段上单独勾选">
-                    <input type="checkbox" data-r="run-select-all-cb">
-                    <span>全选</span>
-                </label>
-                <button type="button" class="bd-btn bd-btn-danger" data-a="del" title="删除选中片段并裁剪视频，时间轴自动衔接">删除片段</button>
-                <div class="bd-mode">
-                    <button type="button" data-a="mode-global" class="active">全局模式</button>
-                    <button type="button" data-a="mode-segment">分段模式</button>
+        const toolbarWrap = document.createElement("div");
+        toolbarWrap.className = "bd-toolbar-wrap";
+        toolbarWrap.innerHTML = `
+            <div class="bd-toolbar">
+                <div class="bd-actions">
+                    <button type="button" class="bd-btn bd-btn-primary" data-a="video">上传视频</button>
+                    <button type="button" class="bd-btn" data-a="video-append" title="上传并追加到时间轴末尾，作为独立片段">追加视频</button>
+                    <button type="button" class="bd-btn" data-a="split">+ 分割</button>
+                    <input type="number" class="bd-num" data-r="equal-n" min="2" max="64" value="2" title="均分段数">
+                    <button type="button" class="bd-btn" data-a="equal">均分</button>
+                    <button type="button" class="bd-btn" data-a="smart-split" title="使用 PySceneDetect 按分镜自动分割（需 pip install scenedetect）">智能分割</button>
+                    <button type="button" class="bd-btn" data-a="run-select-toggle" title="开启后可勾选要运行的片段/提示词组；关闭时运行全部">选择运行</button>
+                    <label class="bd-run-select-all-wrap hidden" data-r="run-select-all-wrap" title="勾选=全选，取消=全部不选；仍可在各片段上单独勾选">
+                        <input type="checkbox" data-r="run-select-all-cb">
+                        <span>全选</span>
+                    </label>
+                    <button type="button" class="bd-btn bd-btn-danger" data-a="del" title="删除选中片段并裁剪视频，时间轴自动衔接">删除片段</button>
+                    <div class="bd-mode">
+                        <button type="button" data-a="mode-global" class="active">全局模式</button>
+                        <button type="button" data-a="mode-segment">分段模式</button>
+                    </div>
+                    <select class="bd-select" data-r="global-task" title="task_type"></select>
+                    <span class="bd-video-tag" data-r="video-name">未上传视频</span>
                 </div>
-                <select class="bd-select" data-r="global-task" title="task_type"></select>
-                <span class="bd-video-tag" data-r="video-name">未上传视频</span>
+                <div class="bd-right">
+                    <div class="bd-bounds" data-r="bounds">Start: 0.00 | End: -</div>
+                    <div class="bd-timecode" data-r="timecode">0.00s</div>
+                </div>
             </div>
-            <div class="bd-right">
-                <div class="bd-bounds" data-r="bounds">Start: 0.00 | End: -</div>
-                <div class="bd-timecode" data-r="timecode">0.00s</div>
-            </div>`;
-        this.root.appendChild(toolbar);
+            <div class="bd-smart-split-msg hidden" data-r="smart-split-msg" role="status"></div>`;
+        this.root.appendChild(toolbarWrap);
+        this.smartSplitMsgEl = toolbarWrap.querySelector('[data-r="smart-split-msg"]');
 
         this.mainBody = document.createElement("div");
         this.mainBody.className = "bd-main";
@@ -1101,6 +1117,17 @@ class BerniniDirectorEditor {
                 </div>
             </div>`;
         this.mainBody.appendChild(controls);
+
+        // Appears above the timeline when a split point is selected.
+        const splitEditBar = document.createElement("div");
+        splitEditBar.className = "bd-split-edit-bar hidden";
+        splitEditBar.setAttribute("data-r", "split-edit-bar");
+        splitEditBar.innerHTML = `
+            <span class="bd-split-edit-hint" data-r="split-edit-hint">已选中分割点</span>
+            <button type="button" class="bd-btn bd-btn-del-split" data-a="del-split" title="删除选中分割点（合并相邻两段）">删除分割点</button>`;
+        this.mainBody.appendChild(splitEditBar);
+        this.splitEditBarEl = splitEditBar;
+        this.splitEditHintEl = splitEditBar.querySelector('[data-r="split-edit-hint"]');
 
         this.viewport = document.createElement("div");
         this.viewport.className = "bd-viewport";
@@ -1360,6 +1387,8 @@ class BerniniDirectorEditor {
         bind('[data-a="video-append"]', () => this.pickAppendVideoFile());
         bind('[data-a="split"]', () => this.splitAtFrame(this.currentFrame));
         bind('[data-a="equal"]', () => this.equalSplit());
+        bind('[data-a="smart-split"]', () => { void this.smartSplit(); });
+        bind('[data-a="del-split"]', () => this.deleteSelectedSplitPoint());
         bind('[data-a="run-select-toggle"]', () => this.toggleRunSelectMode());
         bind('[data-a="del"]', () => this.deleteSelectedSegment());
         bind('[data-a="mode-global"]', () => this.setEditMode("global"));
@@ -1476,7 +1505,7 @@ class BerniniDirectorEditor {
             const { x, y } = this.getMousePos(e);
             const hit = this.hitTest(x, y);
             this.canvas.classList.remove("bd-grab");
-            if (hit?.type === "run-check") {
+            if (hit?.type === "run-check" || hit?.type === "split") {
                 this.canvas.style.cursor = "pointer";
             } else if (hit?.type === "segment" && this.timeline.segments.length >= 2) {
                 this.canvas.classList.add("bd-grab");
@@ -1500,7 +1529,13 @@ class BerniniDirectorEditor {
             const tag = document.activeElement?.tagName;
             if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
             if ((e.key === "Delete" || e.key === "Backspace") && this.timeline.segments.length >= 1) {
-                this.deleteSelectedSegment(); e.preventDefault();
+                // Split points only delete via the toolbar button; Delete removes segments.
+                if (this.selectedSplitFrame != null) {
+                    e.preventDefault();
+                    return;
+                }
+                this.deleteSelectedSegment();
+                e.preventDefault();
             } else if (e.code === "Space") {
                 this.togglePlay(); e.preventDefault();
             } else if (e.key === "ArrowLeft") {
@@ -4054,18 +4089,16 @@ class BerniniDirectorEditor {
         if (!width) return null;
         const segs = this._previewSegments || this.timeline.segments;
         const phx = this.frameToX(this.currentFrame, width);
+        const trackBottom = TRACK_Y + TRACK_H;
 
         if (y <= RULER_H) {
             if (Math.abs(x - phx) <= HANDLE_PX) return { type: "playhead" };
             return { type: "ruler" };
         }
 
-        // Label band is range text only (not a drag / toggle surface).
-        if (y < TRACK_Y) return null;
-
         // Checkbox corner wins over generic segment hit (same toggle action either way
         // in run-select mode; keeps hit type accurate for cursor / future hooks).
-        if (this.isRunSelectEnabled() && segs.length >= 2) {
+        if (this.isRunSelectEnabled() && segs.length >= 2 && y >= TRACK_Y && y <= trackBottom) {
             for (let i = segs.length - 1; i >= 0; i--) {
                 const g = this._runCheckGeometry(segs[i], width);
                 if (x >= g.hitX0 && x <= g.hitX1 && y >= g.hitY0 && y <= g.hitY1) {
@@ -4074,13 +4107,32 @@ class BerniniDirectorEditor {
             }
         }
 
+        // Split markers: label band + full track height, before segment/edge hits.
+        // (Previously label band returned null, so diamond clicks never registered.)
+        if (y >= RULER_H && y <= trackBottom) {
+            const hitPad = Math.max(HANDLE_PX, 12);
+            let best = null;
+            let bestDist = hitPad + 1;
+            for (const frame of this.getEditableSplitFrames()) {
+                const sx = this.frameToX(frame, width);
+                const dist = Math.abs(x - sx);
+                if (dist <= hitPad && dist < bestDist) {
+                    bestDist = dist;
+                    best = { type: "split", frame };
+                }
+            }
+            if (best) return best;
+        }
+
+        if (y < TRACK_Y) return null;
+
         for (let i = segs.length - 1; i >= 0; i--) {
             const seg = segs[i];
             const x0 = this.frameToX(seg.start, width);
             const x1 = this.frameToX(seg.start + seg.length, width);
             const isLast = i === segs.length - 1;
             const insideX = isLast ? (x >= x0 && x <= x1) : (x >= x0 && x < x1);
-            if (insideX && y >= TRACK_Y && y <= TRACK_Y + TRACK_H) {
+            if (insideX && y >= TRACK_Y && y <= trackBottom) {
                 return { type: "segment", index: i };
             }
         }
@@ -4089,7 +4141,7 @@ class BerniniDirectorEditor {
             const seg = segs[i];
             const x0 = this.frameToX(seg.start, width);
             const x1 = this.frameToX(seg.start + seg.length, width);
-            if (y < TRACK_Y || y > TRACK_Y + TRACK_H) continue;
+            if (y < TRACK_Y || y > trackBottom) continue;
             if (Math.abs(x - x0) <= HANDLE_PX) return { type: "edge", index: i, edge: "left" };
             if (Math.abs(x - x1) <= HANDLE_PX) return { type: "edge", index: i, edge: "right" };
         }
@@ -4110,11 +4162,16 @@ class BerniniDirectorEditor {
         if (hit.type === "playhead" || hit.type === "ruler") {
             this.currentFrame = this.xToFrame(x, width);
             this._drag = { kind: "playhead" };
+            this.clearSplitSelection();
         } else if (hit.type === "run-check") {
             this.toggleSegmentRun(hit.index);
             this._drag = null;
+        } else if (hit.type === "split") {
+            this.selectSplitFrame(hit.frame);
+            this._drag = null;
         } else if (hit.type === "segment") {
             this.selectedIndex = hit.index;
+            this.clearSplitSelection();
             this.updateSelectionUI();
             if (this.timeline.segments.length >= 2) {
                 this._drag = {
@@ -4129,6 +4186,7 @@ class BerniniDirectorEditor {
             }
         } else if (hit.type === "edge") {
             this.selectedIndex = hit.index;
+            this.clearSplitSelection();
             this.updateSelectionUI();
             this._drag = { kind: "edge", index: hit.index, edge: hit.edge };
             this._edgeSnapshot = JSON.parse(JSON.stringify(this.timeline.segments));
@@ -4232,7 +4290,9 @@ class BerniniDirectorEditor {
             } else newSegs.push({ ...seg });
         }
         this.timeline.segments = newSegs;
+        this.selectedSplitFrame = null;
         this.commit();
+        this.updateSplitPointUI();
     }
 
     equalSplit() {
@@ -4262,7 +4322,236 @@ class BerniniDirectorEditor {
         const newSegs = this._buildSegmentsFromSplitPoints([...points], forced);
         if (!newSegs?.length) return;
         this.timeline.segments = newSegs;
+        this.selectedSplitFrame = null;
         this.commit();
+        this.updateSplitPointUI();
+    }
+
+    /** Logical ranges for each video clip on the timeline. */
+    getClipLogicalRanges() {
+        const clips = this.getVideoClips();
+        const total = this.getTotalFrames();
+        if (!clips.length) return [];
+        const map = this.getFrameMap();
+        if (map.length) {
+            const ranges = clips.map((clip, clipIndex) => ({
+                clip,
+                clipIndex,
+                start: total,
+                end: 0,
+            }));
+            for (let i = 0; i < map.length; i++) {
+                const entry = normalizeFrameMapEntry(map[i]);
+                const r = ranges[entry.clip];
+                if (!r) continue;
+                if (i < r.start) r.start = i;
+                if (i + 1 > r.end) r.end = i + 1;
+            }
+            return ranges.filter((r) => r.end > r.start);
+        }
+        if (clips.length === 1) {
+            return [{ clip: clips[0], clipIndex: 0, start: 0, end: total }];
+        }
+        let cursor = 0;
+        return clips.map((clip, clipIndex) => {
+            const len = Math.max(0, parseInt(clip.sourceFrameCount, 10) || 0);
+            const start = cursor;
+            const end = Math.min(total, cursor + len);
+            cursor = end;
+            return { clip, clipIndex, start, end };
+        }).filter((r) => r.end > r.start);
+    }
+
+    /** Interior segment boundaries that can be selected/deleted (not clip seams). */
+    getEditableSplitFrames() {
+        const total = this.getTotalFrames();
+        if (total < MIN_SEG * 2) return [];
+        const forced = new Set([0, total, ...this.getClipBoundaries()]);
+        const segs = this._previewSegments || this.timeline.segments || [];
+        const points = [];
+        for (const seg of segs) {
+            const start = Math.max(0, parseInt(seg.start, 10) || 0);
+            if (start > 0 && start < total && !forced.has(start)) points.push(start);
+        }
+        return [...new Set(points)].sort((a, b) => a - b);
+    }
+
+    selectSplitFrame(frame) {
+        const editable = this.getEditableSplitFrames();
+        const n = Number(frame);
+        if (!Number.isFinite(n) || !editable.includes(n)) {
+            this.selectedSplitFrame = null;
+        } else {
+            // Toggle off if clicking the same selected split again.
+            this.selectedSplitFrame = this.selectedSplitFrame === n ? null : n;
+            if (this.selectedSplitFrame != null) {
+                const segs = this.timeline.segments || [];
+                const idx = segs.findIndex((s) => (parseInt(s.start, 10) || 0) === n);
+                if (idx >= 0) this.selectedIndex = idx;
+            }
+        }
+        this.updateSplitPointUI();
+        this.updateSelectionUI();
+        this.scheduleRender();
+    }
+
+    clearSplitSelection() {
+        if (this.selectedSplitFrame == null) return;
+        this.selectedSplitFrame = null;
+        this.updateSplitPointUI();
+        this.scheduleRender();
+    }
+
+    updateSplitPointUI() {
+        const bar = this.splitEditBarEl || this.root?.querySelector('[data-r="split-edit-bar"]');
+        const hint = this.splitEditHintEl || this.root?.querySelector('[data-r="split-edit-hint"]');
+        const btn = this.root?.querySelector('[data-a="del-split"]');
+        if (this.isImageBatch() || this.isGenMode()) {
+            bar?.classList.add("hidden");
+            return;
+        }
+        const has = this.selectedSplitFrame != null
+            && this.getEditableSplitFrames().includes(this.selectedSplitFrame);
+        if (bar) bar.classList.toggle("hidden", !has);
+        if (hint && has) {
+            hint.textContent = `已选中分割点（帧 ${this.selectedSplitFrame}）。点击右侧按钮删除并合并相邻段。`;
+        }
+        if (btn) {
+            btn.disabled = !has;
+            btn.title = has
+                ? `删除选中分割点（帧 ${this.selectedSplitFrame}），合并相邻两段`
+                : "先点击青色分割点选中";
+        }
+        if (has && this.boundsEl) {
+            this.boundsEl.textContent = `已选中分割点: 帧 ${this.selectedSplitFrame}`;
+        }
+    }
+
+    deleteSelectedSplitPoint() {
+        if (this.isGenMode() || this.isImageBatch()) return;
+        const frame = this.selectedSplitFrame;
+        if (frame == null) return;
+        if (!this.getEditableSplitFrames().includes(frame)) {
+            this.clearSplitSelection();
+            return;
+        }
+        const segs = [...(this.timeline.segments || [])].sort((a, b) => a.start - b.start);
+        const rightIdx = segs.findIndex((s) => (parseInt(s.start, 10) || 0) === frame);
+        if (rightIdx <= 0) {
+            this.clearSplitSelection();
+            return;
+        }
+        const left = segs[rightIdx - 1];
+        const right = segs[rightIdx];
+        left.length = (parseInt(left.length, 10) || 0) + (parseInt(right.length, 10) || 0);
+        segs.splice(rightIdx, 1);
+        this.timeline.segments = segs;
+        this.selectedSplitFrame = null;
+        this.selectedIndex = Math.max(0, rightIdx - 1);
+        this.commit();
+        this.updateSelectionUI();
+        this.updateSplitPointUI();
+        this.setSmartSplitMessage("");
+        this.scheduleRender();
+    }
+
+    setSmartSplitMessage(text, { ok = false } = {}) {
+        const el = this.smartSplitMsgEl || this.root?.querySelector('[data-r="smart-split-msg"]');
+        if (!el) return;
+        const msg = String(text || "").trim();
+        if (!msg) {
+            el.textContent = "";
+            el.classList.add("hidden");
+            el.classList.remove("ok");
+            return;
+        }
+        el.textContent = msg;
+        el.classList.toggle("ok", !!ok);
+        el.classList.remove("hidden");
+    }
+
+    async smartSplit() {
+        if (this.isGenMode() || this.isImageBatch()) return;
+        if (!this.hasVideo()) {
+            this.setSmartSplitMessage("请先上传视频后再使用智能分割。");
+            return;
+        }
+        const total = this.getTotalFrames();
+        if (total < MIN_SEG * 2) {
+            this.setSmartSplitMessage("视频太短，无法智能分割。");
+            return;
+        }
+        const ranges = this.getClipLogicalRanges();
+        if (!ranges.length) {
+            this.setSmartSplitMessage("未找到可用的视频素材。");
+            return;
+        }
+        const btn = this.root?.querySelector('[data-a="smart-split"]');
+        const prevLabel = btn?.textContent;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = "分析中…";
+        }
+        this.setSmartSplitMessage("正在分析分镜…");
+        try {
+            const clips = ranges.map((r) => ({
+                videoFile: r.clip.videoFile || r.clip.fileName,
+                subfolder: r.clip.subfolder || "",
+                type: r.clip.type || "input",
+                logicalStart: r.start,
+                logicalEnd: r.end,
+                nativeFps: r.clip.nativeFps || r.clip.native_fps || null,
+            }));
+            const resp = await api.fetchApi("/bernini/director/detect_shots", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    clips,
+                    frameRate: this.getFrameRate(),
+                    totalFrames: total,
+                    sensitivity: "medium",
+                    minShotFrames: Math.max(MIN_SEG, 12),
+                }),
+            });
+            if (!resp.ok) {
+                throw new Error((await resp.text()) || `HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            const cutFrames = Array.isArray(data.cutFrames) ? data.cutFrames.map((n) => parseInt(n, 10) || 0) : [];
+            const points = new Set([0, total, ...cutFrames.filter((f) => f > 0 && f < total)]);
+            const clipBounds = this.getClipBoundaries();
+            for (const b of clipBounds) {
+                if (b > 0 && b < total) points.add(b);
+            }
+            const forced = new Set([0, total, ...clipBounds]);
+            const newSegs = this._buildSegmentsFromSplitPoints([...points], forced);
+            if (!newSegs?.length) {
+                this.setSmartSplitMessage("智能分割未生成有效片段。");
+                return;
+            }
+            this.timeline.segments = newSegs;
+            this.selectedIndex = 0;
+            this.selectedSplitFrame = null;
+            this.commit();
+            this.updateSelectionUI();
+            this.updateSplitPointUI();
+            const shotCount = data.shotCount ?? Math.max(0, newSegs.length);
+            const warn = Array.isArray(data.warnings) && data.warnings.length
+                ? ` ${data.warnings[0]}`
+                : "";
+            this.setSmartSplitMessage(
+                `完成：约 ${shotCount} 个镜头 → ${newSegs.length} 段。您也可以根据自己的需要，选择分割点进行删除，或者手动增加分割点。${warn}`,
+                { ok: !warn },
+            );
+        } catch (err) {
+            console.error("[Bernini Director] smartSplit failed", err);
+            this.setSmartSplitMessage(`智能分割失败：${err?.message || err}`);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = prevLabel || "智能分割";
+            }
+        }
     }
 
     deleteSelectedSegment() {
@@ -4280,6 +4569,7 @@ class BerniniDirectorEditor {
 
         const start = Math.max(0, parseInt(seg.start, 10) || 0);
         const len = Math.max(0, parseInt(seg.length, 10) || 0);
+        this.selectedSplitFrame = null;
 
         // Remove segment UI entry first, then cut matching frames from the
         // logical timeline so preview / export no longer include that range.
@@ -4684,6 +4974,43 @@ class BerniniDirectorEditor {
             this.ctx.stroke();
         }
 
+        // Editable split-point markers: click = select only; delete via toolbar button.
+        const splitFrames = this.getEditableSplitFrames();
+        if (splitFrames.length) {
+            for (const frame of splitFrames) {
+                const sx = this.frameToX(frame, width);
+                const selected = this.selectedSplitFrame === frame;
+                this.ctx.strokeStyle = selected ? "#ffe066" : "rgba(80, 220, 255, 0.95)";
+                this.ctx.fillStyle = selected ? "#ffe066" : "rgba(80, 220, 255, 0.9)";
+                this.ctx.lineWidth = selected ? 3.5 : 2;
+                this.ctx.beginPath();
+                this.ctx.moveTo(sx, RULER_H + 2);
+                this.ctx.lineTo(sx, TRACK_Y + TRACK_H - 2);
+                this.ctx.stroke();
+                const cy = RULER_H + SEG_LABEL_H / 2;
+                const r = selected ? 8 : 6;
+                this.ctx.beginPath();
+                this.ctx.moveTo(sx, cy - r);
+                this.ctx.lineTo(sx + r, cy);
+                this.ctx.lineTo(sx, cy + r);
+                this.ctx.lineTo(sx - r, cy);
+                this.ctx.closePath();
+                this.ctx.fill();
+                if (selected) {
+                    this.ctx.strokeStyle = "#fff";
+                    this.ctx.lineWidth = 1.5;
+                    this.ctx.stroke();
+                    // Halo so selection is obvious on dense timelines.
+                    this.ctx.strokeStyle = "rgba(255, 224, 102, 0.55)";
+                    this.ctx.lineWidth = 6;
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(sx, TRACK_Y);
+                    this.ctx.lineTo(sx, TRACK_Y + TRACK_H);
+                    this.ctx.stroke();
+                }
+            }
+        }
+
         const phx = this.frameToX(this.currentFrame, width);
         this.ctx.strokeStyle = "#ff4444";
         this.ctx.lineWidth = 2;
@@ -4731,8 +5058,17 @@ class BerniniDirectorEditor {
             this.seekBar.value = this.currentFrame;
         }
         if (this.seekBar) this.seekBar.max = Math.max(0, totalFrames - 1);
-        const seg = segs[this.selectedIndex];
-        if (seg) this.boundsEl.textContent = `Start: ${this.formatTime(seg.start)} | End: ${this.formatTime(seg.start + seg.length)}`;
+        if (this.selectedSplitFrame != null && this.getEditableSplitFrames().includes(this.selectedSplitFrame)) {
+            if (this.boundsEl) {
+                this.boundsEl.textContent = `分割点: 帧 ${this.selectedSplitFrame} · 可删除合并相邻段`;
+            }
+        } else {
+            const seg = segs[this.selectedIndex];
+            if (seg && this.boundsEl) {
+                this.boundsEl.textContent = `Start: ${this.formatTime(seg.start)} | End: ${this.formatTime(seg.start + seg.length)}`;
+            }
+        }
+        this.updateSplitPointUI();
     }
 
     /** Jump to an exact 0-based logical frame; syncs seek bar, preview, playhead. */

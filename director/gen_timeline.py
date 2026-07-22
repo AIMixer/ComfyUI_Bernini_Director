@@ -349,16 +349,8 @@ def build_gen_director_plan(
             use_global = False
             seg_prompt = (seg_data.get("prompt") or "").strip() or prompt
             seg_task = seg_data.get("taskType") or seg_data.get("task_type") or task_type
+            # Segment / batch mode: only this group's refs — never inherit global.refs.
             seg_refs = _load_refs(seg_data.get("refs") or [])
-            # Batch UI stores refs per group; users often leave images on global
-            # (e.g. after switching from rv2v). Fall back so r2v/r2i still work.
-            if not seg_refs and global_refs:
-                seg_refs = list(global_refs)
-                log.info(
-                    "gen segment #%d: segment refs empty — using %d global reference image(s)",
-                    idx + 1,
-                    len(seg_refs),
-                )
             seg_negative = (
                 (seg_data.get("negativePrompt") or seg_data.get("negative_prompt") or "").strip()
             )
@@ -374,8 +366,7 @@ def build_gen_director_plan(
         if seg_task_key in ("r2v", "r2i") and not seg_refs:
             log.warning(
                 "gen segment #%d task=%s has no reference images — will behave like "
-                "t2v/t2i. Upload refs on the prompt-batch card (img0–img4), or keep "
-                "them on global.refs before switching task type.",
+                "t2v/t2i. Upload refs on this prompt-batch card (img0–img4).",
                 idx + 1,
                 seg_task_key,
             )

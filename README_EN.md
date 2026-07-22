@@ -15,7 +15,7 @@ Repository: [AIMixer/ComfyUI_Bernini_Director](https://github.com/AIMixer/ComfyU
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-segment timeline** | Upload video in-node; split, equal-split, append; visual timeline with per-segment preview |
+| **Multi-segment timeline** | Upload video in-node; split, equal-split, smart shot-split (PySceneDetect), append; selectable/deletable split points; visual timeline preview |
 | **Task modes** | Full `task_type` list: `default`, `t2i` (text-to-image), `t2v` (text-to-video), `i2i` (image-to-image), `r2i` (reference-to-image), `i2v` (image-to-video, experimental), `v2v` (video-to-video), `r2v` (reference-to-video), `vi2v` (content-propagation edit), `rv2v` (reference-guided edit), `ads2v` (ad insertion), `vrc2v` (subject pose/position tweak), `mv2v` (full-parameter video edit) |
 | **Reference images** | Up to 5 refs (image0–image4); `@imageN` mentions in prompts |
 | **Dual-stage sampling** | Separate HIGH / LOW UNET with independent CFG, seed, steps, split |

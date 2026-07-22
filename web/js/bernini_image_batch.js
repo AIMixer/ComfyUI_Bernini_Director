@@ -701,6 +701,7 @@ export function setToolbarDisabledForBatch(editor, disabled) {
         editor.btnVideo,
         editor.btnVideoAppend,
         editor.root?.querySelector('[data-a="split"]'),
+        editor.root?.querySelector('[data-a="smart-split"]'),
         editor.root?.querySelector('[data-a="equal"]'),
         editor.root?.querySelector('[data-a="del"]'),
         editor.root?.querySelector('[data-a="mode-global"]'),

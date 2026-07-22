@@ -117,6 +117,95 @@ async def bernini_probe_video(request):
     return web.json_response(info)
 
 
+async def bernini_detect_shots(request):
+    """Detect shot boundaries with PySceneDetect; return logical cut frames."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid JSON: {exc}")
+
+    from ..lib.shot_detect import detect_timeline_shot_cuts, scenedetect_available
+
+    if not scenedetect_available():
+        return web.Response(
+            status=400,
+            text=(
+                "PySceneDetect is not installed. "
+                "Run: pip install \"scenedetect<0.8\""
+            ),
+        )
+
+    try:
+        frame_rate = float(body.get("frameRate") or body.get("frame_rate") or 24)
+    except (TypeError, ValueError):
+        frame_rate = 24.0
+    try:
+        total_frames = int(body.get("totalFrames") or body.get("total_frames") or 0)
+    except (TypeError, ValueError):
+        return web.Response(status=400, text="Invalid totalFrames.")
+
+    sensitivity = str(body.get("sensitivity") or "medium").strip().lower()
+    try:
+        min_shot_frames = int(body.get("minShotFrames") or body.get("min_shot_frames") or 12)
+    except (TypeError, ValueError):
+        min_shot_frames = 12
+
+    clips_in = body.get("clips")
+    clips: list[dict] = []
+    if isinstance(clips_in, list) and clips_in:
+        for item in clips_in:
+            if not isinstance(item, dict):
+                continue
+            video_file = str(item.get("videoFile") or item.get("video_file") or "").strip()
+            if not video_file:
+                continue
+            clips.append(
+                {
+                    "videoFile": video_file,
+                    "fileName": os.path.basename(video_file),
+                    "subfolder": str(item.get("subfolder") or "").strip(),
+                    "type": str(item.get("type") or "input").strip() or "input",
+                    "logicalStart": item.get("logicalStart", item.get("logical_start", 0)),
+                    "logicalEnd": item.get("logicalEnd", item.get("logical_end", total_frames)),
+                    "nativeFps": item.get("nativeFps", item.get("native_fps")),
+                }
+            )
+    else:
+        video_file = str(body.get("videoFile") or body.get("video_file") or "").strip()
+        if not video_file:
+            return web.Response(status=400, text="Missing clips[] or videoFile.")
+        clips.append(
+            {
+                "videoFile": video_file,
+                "fileName": os.path.basename(video_file),
+                "subfolder": str(body.get("subfolder") or "").strip(),
+                "type": str(body.get("type") or "input").strip() or "input",
+                "logicalStart": 0,
+                "logicalEnd": total_frames,
+                "nativeFps": body.get("nativeFps", body.get("native_fps")),
+            }
+        )
+
+    if total_frames <= 0:
+        return web.Response(status=400, text="totalFrames must be > 0.")
+
+    try:
+        result = detect_timeline_shot_cuts(
+            clips,
+            frame_rate=frame_rate,
+            total_frames=total_frames,
+            sensitivity=sensitivity,
+            min_shot_frames=min_shot_frames,
+        )
+    except ImportError as exc:
+        return web.Response(status=400, text=str(exc))
+    except Exception as exc:
+        log.warning("Bernini Director shot detect failed: %s", exc)
+        return web.Response(status=400, text=str(exc))
+
+    return web.json_response(result)
+
+
 def _register_route(routes, method: str, path: str, handler) -> None:
     if hasattr(routes, "add_route"):
         routes.add_route(method, path, handler)
@@ -143,6 +232,7 @@ def register_routes() -> bool:
     _register_route(routes, "POST", "/bernini/director/upload_chunk", bernini_upload_video_chunk)
     _register_route(routes, "POST", "/bernini/director/probe_video", bernini_probe_video)
     _register_route(routes, "GET", "/bernini/director/probe_video", bernini_probe_video)
+    _register_route(routes, "POST", "/bernini/director/detect_shots", bernini_detect_shots)
     from .prompt_enhance_routes import register_prompt_enhance_routes
 
     register_prompt_enhance_routes(routes, _register_route)
