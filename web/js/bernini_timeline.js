@@ -236,6 +236,8 @@ const STYLES = `
 .bd-refs-col{display:flex;flex-direction:column;gap:4px;min-width:0;height:100%}
 .bd-refs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;width:100%;flex:1;align-content:start}
 .bd-ref{position:relative;width:100%;aspect-ratio:1;min-width:0;max-height:76px;border:1px dashed #555;border-radius:4px;background:#111;display:flex;align-items:center;justify-content:center;cursor:pointer;overflow:hidden;font-size:9px;color:#666;transition:border-color .15s,background .15s}
+.bd-ref.has-img{cursor:grab;border-style:solid}
+.bd-ref.has-img:active{cursor:grabbing}
 .bd-ref:hover{border-color:#7a9cff;background:#1a1a1a}
 .bd-ref .bd-ref-tag{position:absolute;inset:auto 0 3px 0;text-align:center;font-size:9px;color:#777;pointer-events:none;line-height:1}
 .bd-ref.has-img .bd-ref-tag{display:none}
@@ -1551,6 +1553,10 @@ class BerniniDirectorEditor {
         this.root.addEventListener("dragover", (e) => e.preventDefault());
         this.root.addEventListener("drop", (e) => {
             e.preventDefault();
+            // Slot-to-slot moves are handled on .bd-ref; don't also treat as new upload.
+            const types = [...(e.dataTransfer?.types || [])];
+            if (types.includes("application/x-bernini-ref-slot")) return;
+            if (e.target.closest?.(".bd-ref, .bd-batch-ref")) return;
             const f = e.dataTransfer.files?.[0];
             if (f?.type.startsWith("video/")) this.loadVideoFile(f);
             else if (f?.type.startsWith("image/")) {
@@ -5180,10 +5186,15 @@ class BerniniDirectorEditor {
 
     renderRefSlots(refs, box, isGlobal) {
         box.innerHTML = "";
+        const target = isGlobal
+            ? this.timeline.global
+            : this.timeline.segments[this.selectedIndex];
         for (let i = 0; i < 5; i++) {
             const el = document.createElement("div");
             el.className = "bd-ref";
-            el.title = `image${i} — 点击上传`;
+            el.dataset.refSlot = String(i);
+            el.dataset.refScope = isGlobal ? "global" : "seg";
+            el.title = `image${i} — 点击上传；拖到其他格可移动`;
             const ref = (refs || []).find((r) => Number(r.index ?? r.slot) === i);
             const tag = document.createElement("span");
             tag.className = "bd-ref-tag";
@@ -5193,32 +5204,115 @@ class BerniniDirectorEditor {
                 el.classList.add("has-img");
                 const img = document.createElement("img");
                 img.src = refViewUrl(ref.imageFile);
+                img.draggable = false;
                 el.appendChild(img);
                 const x = document.createElement("span");
                 x.className = "x";
                 x.textContent = "×";
                 x.onclick = (e) => {
                     e.stopPropagation();
-                    this.removeRef(isGlobal ? this.timeline.global : this.timeline.segments[this.selectedIndex], i);
+                    this.removeRef(target, i);
                 };
                 el.appendChild(x);
             } else if (ref?.imageB64) {
                 el.classList.add("has-img");
                 const img = document.createElement("img");
                 img.src = ref.imageB64.startsWith("data:") ? ref.imageB64 : `data:image/png;base64,${ref.imageB64}`;
+                img.draggable = false;
                 el.appendChild(img);
                 const x = document.createElement("span");
                 x.className = "x";
                 x.textContent = "×";
                 x.onclick = (e) => {
                     e.stopPropagation();
-                    this.removeRef(isGlobal ? this.timeline.global : this.timeline.segments[this.selectedIndex], i);
+                    this.removeRef(target, i);
                 };
                 el.appendChild(x);
             }
-            el.onclick = () => this.pickRef(isGlobal ? this.timeline.global : this.timeline.segments[this.selectedIndex], i, isGlobal);
+            this._bindRefSlotDnD(el, target, i, isGlobal);
+            el.onclick = () => {
+                if (this._refDragMoved) {
+                    this._refDragMoved = false;
+                    return;
+                }
+                this.pickRef(target, i, isGlobal);
+            };
             box.appendChild(el);
         }
+    }
+
+    _bindRefSlotDnD(el, target, slotIndex, isGlobal) {
+        const hasImg = el.classList.contains("has-img");
+        el.draggable = hasImg;
+        el.addEventListener("dragstart", (e) => {
+            if (!hasImg) {
+                e.preventDefault();
+                return;
+            }
+            this._refDragMoved = false;
+            const payload = JSON.stringify({
+                scope: isGlobal ? "global" : "seg",
+                segIndex: isGlobal ? -1 : this.selectedIndex,
+                from: slotIndex,
+            });
+            e.dataTransfer.setData("application/x-bernini-ref-slot", payload);
+            e.dataTransfer.setData("text/plain", payload);
+            e.dataTransfer.effectAllowed = "move";
+        });
+        el.addEventListener("dragend", () => {
+            // click may fire after dragend; keep suppress for one tick
+            setTimeout(() => { this._refDragMoved = false; }, 0);
+        });
+        el.addEventListener("dragover", (e) => {
+            const types = e.dataTransfer?.types || [];
+            if (![...types].includes("application/x-bernini-ref-slot") && ![...types].includes("Files")) {
+                return;
+            }
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = [...types].includes("application/x-bernini-ref-slot")
+                ? "move"
+                : "copy";
+        });
+        el.addEventListener("drop", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const raw = e.dataTransfer.getData("application/x-bernini-ref-slot")
+                || e.dataTransfer.getData("text/plain");
+            if (raw) {
+                try {
+                    const data = JSON.parse(raw);
+                    const scope = isGlobal ? "global" : "seg";
+                    if (data.scope !== scope) return;
+                    if (!isGlobal && data.segIndex !== this.selectedIndex) return;
+                    this._refDragMoved = true;
+                    this.moveRefSlot(target, Number(data.from), slotIndex, isGlobal);
+                    return;
+                } catch (_) { /* fall through to file drop */ }
+            }
+            const f = e.dataTransfer.files?.[0];
+            if (f?.type?.startsWith("image/")) {
+                this.addRefFromFile(f, target, slotIndex, isGlobal);
+            }
+        });
+    }
+
+    moveRefSlot(target, fromIndex, toIndex, isGlobal) {
+        if (!target || fromIndex === toIndex) return;
+        const refs = [...(target.refs || [])];
+        const fromRef = refs.find((r) => Number(r.index ?? r.slot) === fromIndex);
+        if (!fromRef) return;
+        const toRef = refs.find((r) => Number(r.index ?? r.slot) === toIndex);
+        target.refs = refs.filter((r) => {
+            const idx = Number(r.index ?? r.slot);
+            return idx !== fromIndex && idx !== toIndex;
+        });
+        target.refs.push({ ...fromRef, index: toIndex, slot: undefined });
+        if (toRef) {
+            target.refs.push({ ...toRef, index: fromIndex, slot: undefined });
+        }
+        if (isGlobal) this.timeline.global = target;
+        this.commit();
     }
 
     removeRef(target, index) {

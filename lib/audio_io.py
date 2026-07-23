@@ -442,6 +442,9 @@ def extract_timeline_audio(
 
     chunks: list[torch.Tensor] = []
     sr = 44100
+    resampled_spans = 0
+    media_total = 0.0
+    out_total = 0.0
     for path, start_sec, media_dur, out_dur in spans:
         full = _load_full_audio(path)
         if full is None:
@@ -453,15 +456,28 @@ def extract_timeline_audio(
         n_out = max(1, int(round(float(out_dur) * sr)))
         piece = _slice_samples(wave, src_start=i0, n_samples=n_media)
         if n_out != n_media:
-            log.info(
-                "Source audio: PTS media %.3fs → timeline %.3fs (%d → %d samples)",
-                media_dur,
-                out_dur,
-                n_media,
-                n_out,
-            )
+            resampled_spans += 1
+            media_total += float(media_dur)
+            out_total += float(out_dur)
             piece = _resample_wave_to_samples(piece, n_out)
         chunks.append(piece)
+
+    if resampled_spans > 0:
+        log.info(
+            "Source audio: PTS→timeline remap on %d span(s), "
+            "media %.3fs → timeline %.3fs (%d frame window(s))",
+            resampled_spans,
+            media_total,
+            out_total,
+            len(spans),
+        )
+        if len(spans) > 50 and resampled_spans == len(spans):
+            log.warning(
+                "Source audio: %d one-shot spans (timeline fps likely ≠ source PTS). "
+                "Prefer matching Director fps to source; sync still remaps but "
+                "fragmented cuts are less ideal.",
+                len(spans),
+            )
 
     if not chunks:
         return None

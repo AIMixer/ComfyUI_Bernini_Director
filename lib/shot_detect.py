@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 log = logging.getLogger("ComfyUI-Bernini-Director.shot_detect")
@@ -16,6 +17,12 @@ _SENSITIVITY_THRESHOLD = {
     "medium": 3.0,
     "high": 2.0,
 }
+
+
+def scenedetect_install_hint() -> str:
+    """Install command for the same Python that is running ComfyUI."""
+    py = sys.executable or "python"
+    return f'"{py}" -m pip install "scenedetect>=0.6.4,<0.8"'
 
 
 def scenedetect_available() -> bool:
@@ -33,7 +40,7 @@ def _require_scenedetect():
     except ImportError as exc:
         raise ImportError(
             "PySceneDetect is required for smart shot split. "
-            "Install: pip install 'scenedetect<0.8'"
+            f"Install into ComfyUI's Python: {scenedetect_install_hint()}"
         ) from exc
     return AdaptiveDetector, detect
 
@@ -155,7 +162,7 @@ def detect_timeline_shot_cuts(
     if not scenedetect_available():
         raise ImportError(
             "PySceneDetect is required for smart shot split. "
-            "Install: pip install 'scenedetect<0.8'"
+            f"Install into ComfyUI's Python: {scenedetect_install_hint()}"
         )
 
     timeline_fps = float(frame_rate) if frame_rate and frame_rate > 0 else 24.0

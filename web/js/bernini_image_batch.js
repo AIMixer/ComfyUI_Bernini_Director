@@ -362,15 +362,65 @@ async function uploadSegRef(editor, index, slot) {
     pickFile("image/*", (file) => assignSegRefFromFile(editor, index, slot, file));
 }
 
+function moveBatchRefSlot(editor, segIndex, fromSlot, toSlot) {
+    if (fromSlot === toSlot) return;
+    const seg = editor.timeline.segments[segIndex];
+    if (!seg) return;
+    const refs = [...(seg.refs || [])];
+    const fromRef = refs.find((r) => Number(r.index ?? r.slot) === fromSlot);
+    if (!fromRef) return;
+    const toRef = refs.find((r) => Number(r.index ?? r.slot) === toSlot);
+    seg.refs = refs.filter((r) => {
+        const idx = Number(r.index ?? r.slot);
+        return idx !== fromSlot && idx !== toSlot;
+    });
+    seg.refs.push({ ...fromRef, index: toSlot, slot: undefined });
+    if (toRef) {
+        seg.refs.push({ ...toRef, index: fromSlot, slot: undefined });
+    }
+    editor.renderImageBatchGroups();
+    editor.commit();
+}
+
 function bindBatchRefDrop(slot, editor, index, slotIndex) {
+    const hasImg = slot.classList.contains("has-img");
+    slot.draggable = hasImg;
+    slot.addEventListener("dragstart", (e) => {
+        if (!hasImg) {
+            e.preventDefault();
+            return;
+        }
+        editor._batchRefDragMoved = false;
+        const payload = JSON.stringify({ segIndex: index, from: slotIndex });
+        e.dataTransfer.setData("application/x-bernini-ref-slot", payload);
+        e.dataTransfer.setData("text/plain", payload);
+        e.dataTransfer.effectAllowed = "move";
+    });
+    slot.addEventListener("dragend", () => {
+        setTimeout(() => { editor._batchRefDragMoved = false; }, 0);
+    });
     slot.addEventListener("dragover", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        e.dataTransfer.dropEffect = "copy";
+        const types = [...(e.dataTransfer?.types || [])];
+        e.dataTransfer.dropEffect = types.includes("application/x-bernini-ref-slot")
+            ? "move"
+            : "copy";
     });
     slot.addEventListener("drop", (e) => {
         e.preventDefault();
         e.stopPropagation();
+        const raw = e.dataTransfer.getData("application/x-bernini-ref-slot")
+            || e.dataTransfer.getData("text/plain");
+        if (raw) {
+            try {
+                const data = JSON.parse(raw);
+                if (Number(data.segIndex) !== index) return;
+                editor._batchRefDragMoved = true;
+                moveBatchRefSlot(editor, index, Number(data.from), slotIndex);
+                return;
+            } catch (_) { /* fall through */ }
+        }
         const f = e.dataTransfer.files?.[0];
         if (f) assignSegRefFromFile(editor, index, slotIndex, f);
     });
@@ -396,9 +446,11 @@ function renderSourceSlot(el, imageFile) {
 function renderRefSlot(el, ref, slot, index, editor) {
     el.classList.toggle("has-img", !!ref?.imageFile);
     el.innerHTML = "";
+    el.title = `img${slot} — 点击上传；拖到其他格可移动`;
     if (ref?.imageFile) {
         const img = document.createElement("img");
         img.src = viewUrl(ref.imageFile);
+        img.draggable = false;
         el.appendChild(img);
         const x = document.createElement("span");
         x.className = "x";
@@ -635,7 +687,13 @@ export function renderImageBatchGroups(editor) {
                 const slot = document.createElement("div");
                 slot.className = "bd-batch-ref";
                 renderRefSlot(slot, ref, i, index, editor);
-                slot.onclick = () => uploadSegRef(editor, index, i);
+                slot.onclick = () => {
+                    if (editor._batchRefDragMoved) {
+                        editor._batchRefDragMoved = false;
+                        return;
+                    }
+                    uploadSegRef(editor, index, i);
+                };
                 bindBatchRefDrop(slot, editor, index, i);
                 refs.appendChild(slot);
             }

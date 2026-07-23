@@ -124,14 +124,19 @@ async def bernini_detect_shots(request):
     except Exception as exc:
         return web.Response(status=400, text=f"Invalid JSON: {exc}")
 
-    from ..lib.shot_detect import detect_timeline_shot_cuts, scenedetect_available
+    from ..lib.shot_detect import (
+        detect_timeline_shot_cuts,
+        scenedetect_available,
+        scenedetect_install_hint,
+    )
 
     if not scenedetect_available():
         return web.Response(
             status=400,
             text=(
-                "PySceneDetect is not installed. "
-                "Run: pip install \"scenedetect<0.8\""
+                "PySceneDetect is not installed in ComfyUI's Python "
+                f"({__import__('sys').executable}). "
+                f"Run: {scenedetect_install_hint()}"
             ),
         )
 
