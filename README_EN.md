@@ -43,11 +43,7 @@ Upgrade **ComfyUI** to a build that includes official Bernini support or newer (
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/AIMixer/ComfyUI_Bernini_Director.git
-```
 
-Optional:
-
-```bash
 pip install -r ComfyUI_Bernini_Director/requirements.txt
 ```
 

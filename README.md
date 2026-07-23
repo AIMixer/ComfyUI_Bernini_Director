@@ -42,13 +42,8 @@
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/AIMixer/ComfyUI_Bernini_Director.git
-```
 
-可选依赖（智能分割需要 PySceneDetect）：
-
-```bash
 pip install -r ComfyUI_Bernini_Director/requirements.txt
-# 或单独安装：pip install "scenedetect<0.8"
 ```
 
 重启 ComfyUI。
