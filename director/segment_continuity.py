@@ -5,14 +5,19 @@ When continuity is **off**: Studio / per-segment path — segment source + user 
 
 When continuity is **on** (WanSCAIL-style handoff on the official Bernini stack):
 1. Prepend prev-tail pixels to ``source_video`` so canvas length matches generation
-2. Generate ``prefix + segment (+ seam echo budget)`` frames, trim prefix after decode
+2. Generate ``prefix + segment`` frames (Wan 4n+1), trim prefix after decode
 3. SCAIL latent prefix lock via ``noise_mask`` (prefix not resampled)
 4. Append **one** appearance ref frame to ``context_latents``
-5. Drop VAE temporal "echo" frames at the body start (look like a short replay of
-   the previous tail) before keeping ``target_len`` frames
+5. Keep the timeline body in source order — do **not** MAD-skip leading body
+   frames (that deletes the SCAIL handoff and looks like continuity is off)
 6. Match source canvas length to ``gen_frames`` (lookahead / mirror) so Wan does not
    sample hollow end frames that freeze the segment tail
-7. Do **not** inject a second full motion stream (that duplicated / shifted
+7. Carry ``noise_mask`` through **both** high and low sample stages (stripping it
+   in low stage was the main “continuity looks like OFF” regression)
+8. Feather lock edge; optional light nudge of body[0..] toward prev's *last*
+   frame only — never sequence-lerp ``prev[-n:]`` into ``body[:n]`` (that
+   replays the previous ending as duplicate frames at every cut)
+9. Do **not** inject a second full motion stream (that duplicated / shifted
    source_id channels and caused seam jumps + temporal stutter)
 """
 
@@ -34,13 +39,24 @@ CONTINUITY_TASK_KEYS = frozenset({"v2v", "rv2v", "vi2v", "vrc2v", "mv2v", "ads2v
 DEFAULT_CONTINUITY_OVERLAP = 9
 MIN_CONTINUITY_OVERLAP = 1
 MAX_CONTINUITY_OVERLAP = 81
-MAX_CONTINUITY_REF_FRAMES = 1
-# Wan VAE temporal stride is 4; keep a few spare body frames so we can drop
-# post-lock "echo" frames that visually replay the previous segment tail.
-CONTINUITY_SEAM_ECHO_BUDGET = 4
+# Last N frames of prev as appearance refs (hair/outfit pop at joins needs >1).
+MAX_CONTINUITY_REF_FRAMES = 2
+# Leading-body MAD skip disabled: on successful rv2v/SCAIL handoff the body
+# start *should* resemble prev tail; trimming it removes continuity.
+CONTINUITY_SEAM_ECHO_BUDGET = 0
 CONTINUITY_SEAM_ECHO_MAD = 8.0
-CONTINUITY_SEAM_JOIN_MAX_SKIP = 4
+CONTINUITY_SEAM_JOIN_MAX_SKIP = 0
 CONTINUITY_SEAM_JOIN_MAD = 8.0
+# Source-only lookahead past segment end for wan-align coverage (not an export skip).
+CONTINUITY_SOURCE_LOOKAHEAD = 4
+# Soften hard lock→body cliff (becomes the visible segment cut after prefix trim).
+CONTINUITY_LOCK_FEATHER_LATENT = 1
+CONTINUITY_LOCK_FEATHER_MASK = 0.35
+# Do NOT sequence-lerp body[:n] with prev[-n:] — that replays the previous ending
+# at every cut (visible duplicate frames). Optional: nudge first frames toward
+# prev's *last* frame only (no temporal replay).
+CONTINUITY_OPENING_LAST_FRAME_BLEND = 2
+CONTINUITY_OPENING_LAST_FRAME_WEIGHT = 0.25
 
 
 def resolve_continuity_settings(timeline: dict, *, segment_count: int) -> tuple[bool, int]:
@@ -85,9 +101,8 @@ def resolve_segment_generation_frames(
 ) -> tuple[int, int]:
     """Return (gen_frames, prefix_trim_after_decode).
 
-    Continuity segments generate ``lock + body + echo_budget`` (Wan-aligned) so
-    decode can drop prefix lock frames and any leading seam-echo frames while
-    still keeping a full ``body``-length export chunk.
+    Continuity segments generate ``lock + body + source_lookahead`` (Wan-aligned).
+    After decode we drop the lock prefix and keep the body in source order.
     """
     body = max(1, int(segment_frame_count))
     if not continuity_enabled or segment_index <= 0:
@@ -95,7 +110,9 @@ def resolve_segment_generation_frames(
     lock_px = resolve_continuity_lock_pixels(continuity_overlap)
     if lock_px <= 0:
         return wan_align_frame_count(body), 0
-    raw = lock_px + body + CONTINUITY_SEAM_ECHO_BUDGET
+    # Include source lookahead so Wan 4n+1 padding is real timeline frames
+    # (from 4ccd545), not hollow mirror tails that freeze near the cut.
+    raw = lock_px + body + CONTINUITY_SOURCE_LOOKAHEAD
     return wan_align_frame_count(raw), lock_px
 
 
@@ -118,16 +135,20 @@ def count_leading_seam_echo_frames(
     body: torch.Tensor,
     prev_tail: torch.Tensor | None,
     *,
-    max_skip: int = CONTINUITY_SEAM_ECHO_BUDGET,
+    max_skip: int = 4,
     mad_threshold: float = CONTINUITY_SEAM_ECHO_MAD,
 ) -> int:
-    """Count leading body frames that replay the end of ``prev_tail``.
+    """Diagnostic: count leading body frames that replay ``prev_tail``.
 
-    Prefers the longest match of ``body[:k] ≈ prev_tail[-k:]``. A short replay
-    often copies an earlier slice of the previous tail, so requiring ``k=1``
-    (body[0] ≈ prev[-1]) first would miss the real overlap.
+    Not used to shift export/merge — dropping these removes the SCAIL handoff
+    (result looks like continuity is off, especially on successful rv2v).
     """
-    if prev_tail is None or int(body.shape[0]) <= 0 or int(prev_tail.shape[0]) <= 0:
+    if (
+        prev_tail is None
+        or max_skip <= 0
+        or int(body.shape[0]) <= 0
+        or int(prev_tail.shape[0]) <= 0
+    ):
         return 0
     limit = min(int(max_skip), int(body.shape[0]), int(prev_tail.shape[0]))
     if limit <= 0:
@@ -191,6 +212,52 @@ def resolve_prev_segment_output(
     )
 
 
+def _frame_mean_luminance(frame: torch.Tensor) -> float:
+    """Mean Rec.601 luma for an HWC tensor in [0, 1] (from 8d2e27c)."""
+    f = frame.float()
+    luma = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+    return float(luma.mean().item())
+
+
+def _tensor_mean_luminance(frames: torch.Tensor) -> float:
+    """Mean Rec.601 luma over a frame batch (from 8d2e27c)."""
+    f = frames.float()
+    if f.dim() == 3:
+        f = f.unsqueeze(0)
+    luma = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+    return float(luma.mean().item())
+
+
+def normalize_guide_luma_to_source(
+    guide: torch.Tensor,
+    source_frame: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> torch.Tensor:
+    """Match guide batch mean luma to a source frame (8d2e27c prepend path)."""
+    if guide is None or int(guide.shape[0]) <= 0:
+        return guide
+    ref = source_frame
+    if ref.dim() == 4:
+        ref = ref[0]
+    ref = fit_canvas(ref.unsqueeze(0), width, height)[0]
+    out = fit_canvas(guide, width, height).float()
+    ref_mean = max(_frame_mean_luminance(ref), 1e-6)
+    guide_mean = max(_tensor_mean_luminance(out), 1e-6)
+    ratio = ref_mean / guide_mean
+    ratio = max(0.55, min(1.8, ratio))
+    if abs(ratio - 1.0) < 0.01:
+        return out.to(dtype=guide.dtype)
+    log.info(
+        "Segment continuity: normalize guide luma ×%.3f (guide=%.3f → source=%.3f)",
+        ratio,
+        guide_mean,
+        ref_mean,
+    )
+    return (out * ratio).clamp(0.0, 1.0).to(dtype=guide.dtype)
+
+
 def prepend_continuity_source(
     clip_frames: torch.Tensor,
     prev_output: torch.Tensor | None,
@@ -203,14 +270,22 @@ def prepend_continuity_source(
 
     Without this, generation length is extended but source stays segment-only →
     temporal misalignment → hard seams / pose resets at segment boundaries.
+
+    Restores 8d2e27c luma normalize on the guide prefix so exposure does not
+    flash at the cut (no whole-segment post luma — that caused smile drift).
     """
     if prev_output is None or lock_px <= 0 or int(clip_frames.shape[0]) <= 0:
         return clip_frames
     n = min(int(lock_px), int(prev_output.shape[0]))
     if n <= 0:
         return clip_frames
-    prefix = fit_canvas(prev_output[-n:], width, height)
     body = fit_canvas(clip_frames, width, height)
+    prefix = normalize_guide_luma_to_source(
+        prev_output[-n:],
+        body[0],
+        width=width,
+        height=height,
+    )
     prefix = prefix.to(device=body.device, dtype=body.dtype)
     out = torch.cat([prefix, body], dim=0)
     log.info(
@@ -279,23 +354,34 @@ def apply_scail_prefix_to_latent(
     latent: dict[str, Any],
     tail_latent: torch.Tensor,
     overlap_pixel_frames: int,
-) -> dict[str, Any]:
-    """Write prev-tail prefix into latent + noise_mask=0 (official KSampler path)."""
+) -> tuple[dict[str, Any], bool]:
+    """Write prev-tail prefix into latent + noise_mask=0 (official KSampler path).
+
+    Returns ``(latent, applied)``. Spatial mismatch is resized instead of silently
+    skipping (silent skip made continuity look identical to OFF).
+    """
     tail_latent = _normalize_context_latent_5d(tail_latent)
     samples = latent["samples"]
     if samples.ndim == 4:
         samples = samples.unsqueeze(0)
     _, _c, t_total, h, w = samples.shape
-    if int(tail_latent.shape[3]) != h or int(tail_latent.shape[4]) != w:
+    th, tw = int(tail_latent.shape[3]), int(tail_latent.shape[4])
+    if th != h or tw != w:
         log.warning(
-            "Segment continuity: skip SCAIL prefix — spatial mismatch "
-            "tail %dx%d vs latent %dx%d",
-            int(tail_latent.shape[3]),
-            int(tail_latent.shape[4]),
+            "Segment continuity: SCAIL spatial mismatch tail %dx%d vs latent %dx%d "
+            "— resizing tail latent (was a silent skip)",
+            th,
+            tw,
             h,
             w,
         )
-        return latent
+        # [1,C,F,H,W] → interpolate over H,W per temporal slice.
+        b, c, f, _, _ = tail_latent.shape
+        flat = tail_latent.reshape(b * c * f, 1, th, tw)
+        flat = torch.nn.functional.interpolate(
+            flat.float(), size=(h, w), mode="bilinear", align_corners=False
+        )
+        tail_latent = flat.to(dtype=tail_latent.dtype).reshape(b, c, f, h, w)
     aligned_pixels = wan_align_frame_count(int(overlap_pixel_frames))
     t_tail = min(
         int(tail_latent.shape[2]),
@@ -303,7 +389,7 @@ def apply_scail_prefix_to_latent(
         t_total,
     )
     if t_tail <= 0:
-        return latent
+        return latent, False
 
     out = dict(latent)
     patched = samples.clone()
@@ -316,14 +402,24 @@ def apply_scail_prefix_to_latent(
         device=patched.device,
     )
     noise_mask[:, :, :t_tail] = 0.0
+    # Feather the last locked latent frame(s) so free body does not hard-cut away
+    # from the frozen prefix (that cliff becomes the segment seam after trim).
+    feather = min(int(CONTINUITY_LOCK_FEATHER_LATENT), max(0, t_tail - 1))
+    if feather > 0:
+        for i in range(feather):
+            # ramp 0 → CONTINUITY_LOCK_FEATHER_MASK across the feather window
+            t = t_tail - feather + i
+            alpha = float(CONTINUITY_LOCK_FEATHER_MASK) * float(i + 1) / float(feather)
+            noise_mask[:, :, t] = alpha
     out["samples"] = patched
     out["noise_mask"] = noise_mask
     log.info(
-        "Segment continuity: SCAIL prefix lock %d latent frame(s) (%d px)",
+        "Segment continuity: SCAIL prefix lock %d latent frame(s) (%d px, feather=%d)",
         t_tail,
         aligned_pixels,
+        feather,
     )
-    return out
+    return out, True
 
 
 def _context_latents_from_conditioning(conditioning) -> list[torch.Tensor]:
@@ -343,14 +439,18 @@ def append_tail_reference_latent(
     width: int,
     height: int,
     ref_max_size: int,
+    n_frames: int = 1,
 ) -> list[torch.Tensor]:
-    """Append last prev frame as one reference-image latent (appearance only)."""
+    """Append last ``n_frames`` of prev as appearance reference latents."""
     if int(prev_output.shape[0]) <= 0:
         return streams
-    frame = fit_canvas(prev_output[-1:], width, height)
-    lat = _encode_reference_latent(vae, frame, ref_max_size)
-    log.info("Segment continuity: appended 1 appearance reference latent")
-    return list(streams) + [lat]
+    n = min(max(1, int(n_frames)), int(prev_output.shape[0]))
+    out = list(streams)
+    for frame in fit_canvas(prev_output[-n:], width, height):
+        lat = _encode_reference_latent(vae, frame.unsqueeze(0), ref_max_size)
+        out.append(lat)
+    log.info("Segment continuity: appended %d appearance reference latent(s)", n)
+    return out
 
 
 def apply_continuity_to_core_conditioning(
@@ -377,6 +477,7 @@ def apply_continuity_to_core_conditioning(
         width=width,
         height=height,
         ref_max_size=ref_max_size,
+        n_frames=n_ref_frames,
     )
     payload = {"context_latents": streams}
     positive = node_helpers.conditioning_set_values(positive, payload)
@@ -397,7 +498,7 @@ def apply_scail_continuity_core(
     ref_max_size: int = 848,
     latent: dict[str, Any] | None = None,
 ) -> tuple[Any, Any, dict[str, Any] | None, str | None]:
-    """SCAIL latent prefix + one appearance ref. Source prepend happens in executor."""
+    """SCAIL latent prefix + appearance refs. Source prepend happens in executor."""
     if not is_continuity_active(plan, seg) or prev_output is None:
         return positive, negative, latent, None
 
@@ -427,16 +528,48 @@ def apply_scail_continuity_core(
         ref_max_size=ref_max_size,
         n_ref_frames=ref_frames,
     )
+    scail_ok = False
     if latent is not None:
-        latent = apply_scail_prefix_to_latent(latent, tail_latent, lock_px)
+        latent, scail_ok = apply_scail_prefix_to_latent(latent, tail_latent, lock_px)
 
     t_lock = _latent_frame_count(wan_align_frame_count(lock_px))
-    note = (
-        f"  continuity branch seg #{seg.index + 1}: source-prepend + SCAIL lock "
-        f"{lock_px}f ({t_lock} latent) + {ref_frames}f ref "
-        f"(overlap {plan.continuity_overlap_frames})"
-    )
+    if scail_ok:
+        note = (
+            f"  continuity branch seg #{seg.index + 1}: source-prepend + SCAIL lock "
+            f"{lock_px}f ({t_lock} latent, kept through dual-stage) + {ref_frames}f ref "
+            f"(overlap {plan.continuity_overlap_frames})"
+        )
+    else:
+        note = (
+            f"  continuity branch seg #{seg.index + 1}: source-prepend + {ref_frames}f ref "
+            f"— SCAIL lock FAILED (seg will jump like continuity OFF)"
+        )
+        log.error(
+            "Segment continuity: SCAIL lock failed for seg #%d — handoff degraded",
+            seg.index + 1,
+        )
     return positive, negative, latent, note
+
+
+def _blend_opening_toward_last_frame(
+    body: torch.Tensor,
+    guide: torch.Tensor,
+    *,
+    blend_frames: int = CONTINUITY_OPENING_LAST_FRAME_BLEND,
+    max_weight: float = CONTINUITY_OPENING_LAST_FRAME_WEIGHT,
+) -> torch.Tensor:
+    """Nudge body head toward prev's last frame only — never replay prev[-n:]."""
+    n = min(int(blend_frames), int(body.shape[0]))
+    if n <= 0 or guide is None or int(guide.shape[0]) <= 0 or max_weight <= 0:
+        return body
+    out = body.clone()
+    last = guide[-1:].to(device=out.device, dtype=out.dtype)
+    if last.shape[1:] != out.shape[1:]:
+        last = fit_canvas(last, int(out.shape[2]), int(out.shape[1]))
+    for i in range(n):
+        w = float(max_weight) * (1.0 - float(i) / float(n))
+        out[i] = last[0] * w + out[i] * (1.0 - w)
+    return out
 
 
 def trim_decoded_for_continuity(
@@ -445,37 +578,32 @@ def trim_decoded_for_continuity(
     prefix_trim: int,
     target_len: int,
     prev_tail: torch.Tensor | None = None,
-    max_echo_skip: int = CONTINUITY_SEAM_ECHO_BUDGET,
+    max_echo_skip: int = 0,
 ) -> torch.Tensor:
-    """Drop SCAIL overlap prefix, seam-echo frames, then cut to target length."""
+    """Drop SCAIL overlap prefix, optional last-frame nudge, keep body length.
+
+    Sequence crossfade against ``prev[-n:]`` is intentionally NOT used — it
+    replayed the previous ending at every cut (duplicate frames in 00101).
+    """
+    del max_echo_skip  # retained for call-site compat; not used
+    prefix_trim = max(0, int(prefix_trim))
     out = decoded
-    if prefix_trim > 0 and out.shape[0] > prefix_trim:
-        out = out[prefix_trim:]
-    elif prefix_trim > 0 and out.shape[0] == prefix_trim:
-        out = out[:0]
+    if prefix_trim > 0 and int(decoded.shape[0]) > prefix_trim:
+        out = decoded[prefix_trim:]
+    elif prefix_trim > 0 and int(decoded.shape[0]) == prefix_trim:
+        out = decoded[:0]
 
-    if (
-        prev_tail is not None
-        and max_echo_skip > 0
-        and target_len > 0
-        and int(out.shape[0]) > int(target_len)
-    ):
-        spare = int(out.shape[0]) - int(target_len)
-        echo = count_leading_seam_echo_frames(
-            out,
-            prev_tail,
-            max_skip=min(int(max_echo_skip), spare),
-        )
-        if echo > 0:
-            out = out[echo:]
-            log.info(
-                "Segment continuity: dropped %d leading seam-echo frame(s) "
-                "(VAE bleed / short replay of prev tail)",
-                echo,
-            )
-
-    if target_len > 0 and out.shape[0] > target_len:
+    if target_len > 0 and int(out.shape[0]) > target_len:
         out = out[:target_len]
+
+    guide = None
+    if prev_tail is not None and int(prev_tail.shape[0]) > 0:
+        guide = prev_tail
+    elif prefix_trim > 0 and int(decoded.shape[0]) > prefix_trim:
+        guide = decoded[:prefix_trim]
+
+    if guide is not None and int(out.shape[0]) > 0:
+        out = _blend_opening_toward_last_frame(out, guide)
     return out
 
 
@@ -483,48 +611,16 @@ def continuity_merged_frame_count(plan: DirectorPlan) -> int:
     return int(plan.total_frames)
 
 
-def _seam_skip_leading_frames(
-    prev: torch.Tensor,
-    nxt: torch.Tensor,
-    *,
-    max_skip: int = CONTINUITY_SEAM_JOIN_MAX_SKIP,
-    mad_threshold: float = CONTINUITY_SEAM_JOIN_MAD,
-) -> int:
-    """Skip leading frames of ``nxt`` that replay ``prev``'s tail (concat safety net)."""
-    if int(prev.shape[0]) <= 0 or int(nxt.shape[0]) <= 1:
-        return 0
-    # Keep at least one frame from the next chunk.
-    return count_leading_seam_echo_frames(
-        nxt,
-        prev,
-        max_skip=min(int(max_skip), int(nxt.shape[0]) - 1),
-        mad_threshold=mad_threshold,
-    )
-
-
 def concat_continuous_chunks(
     chunks: list[torch.Tensor],
     segments: list[SegmentPlan],
     plan: DirectorPlan,
 ) -> torch.Tensor:
-    """Concatenate segments; skip short seam replays when continuity is on."""
+    """Concatenate segment bodies in order (no sequence crossfade / no replay)."""
+    del segments, plan
     if not chunks:
         raise ValueError("concat_continuous_chunks: no chunks")
-    if not plan.continuity_enabled or len(chunks) <= 1:
-        return cat_frames_variable_size(chunks)
-
-    merged = chunks[0]
-    for seg, chunk in zip(segments[1:], chunks[1:]):
-        skip = _seam_skip_leading_frames(merged, chunk)
-        use = chunk[skip:] if skip > 0 else chunk
-        merged = cat_frames_variable_size([merged, use])
-        log.info(
-            "Segment continuity merge: seg #%d +%d frame(s)%s",
-            seg.index + 1,
-            int(use.shape[0]),
-            f" (skipped {skip} seam-echo)" if skip else "",
-        )
-    return merged
+    return cat_frames_variable_size(chunks)
 
 
 def apply_cached_segment_continuity(

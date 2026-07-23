@@ -34,7 +34,7 @@ from .plan import (
 from .progress import report_director_finish, report_director_progress, report_director_segment_preview
 from .segment_cache import load_segment_cache, save_segment_cache
 from .segment_continuity import (
-    CONTINUITY_SEAM_ECHO_BUDGET,
+    CONTINUITY_SOURCE_LOOKAHEAD,
     apply_cached_segment_continuity,
     apply_scail_continuity_core,
     concat_continuous_chunks,
@@ -100,8 +100,8 @@ def execute_director_plan_core(
     completed_outputs: dict[int, torch.Tensor] = {}
     if plan.continuity_enabled:
         reports.append(
-            "Segment continuity: ON — SCAIL prefix lock + source prepend + "
-            "seam-echo trim (drops short prev-tail replay at joins)"
+            "Segment continuity: ON — SCAIL prefix lock (both sample stages) + "
+            "source prepend + luma-matched guide (no leading seam skip)"
         )
     else:
         reports.append(
@@ -135,7 +135,8 @@ def execute_director_plan_core(
         # matches a fully-conditioned source canvas (avoids hollow-tail freeze).
         lookahead = 0
         if seg_continuity and not is_one_frame_i2v:
-            lookahead = CONTINUITY_SEAM_ECHO_BUDGET + 4
+            # Conditioning-only frames past the body so gen length is covered.
+            lookahead = CONTINUITY_SOURCE_LOOKAHEAD
         raw_clip = resolve_segment_raw_clip_with_lookahead(
             plan, seg, end_extra=lookahead
         )
