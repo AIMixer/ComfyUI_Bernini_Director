@@ -149,7 +149,7 @@ def source_audio_report_note(
     if any(_audio_has_samples(a) for a in audio_out):
         return (
             "\n\nSource audio: extracted from input video "
-            "(PTS frame clock → resample to timeline fps)."
+            "(frame-aligned PCM cut, length = picture / timeline fps)."
         )
 
     fps = float(plan.frame_rate or 24.0)
