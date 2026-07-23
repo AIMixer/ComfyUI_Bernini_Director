@@ -453,5 +453,10 @@ def finalize_director_outputs(
     images_out = _ensure_nonempty_image_batches(images_out, label="images")
     source_images_out = _ensure_nonempty_image_batches(source_images_out, label="source_images")
 
+    report = (
+        report
+        + "\n\n有问题联系作者：AI搅拌手  QQ交流群：551482703"
+    )
+
     fps_out = float(plan.frame_rate or 24.0)
     return images_out, audio_out, fps_out, frame_count, source_images_out, report
