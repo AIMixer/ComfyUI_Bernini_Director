@@ -39,6 +39,7 @@ from .segment_continuity import (
     apply_scail_continuity_core,
     concat_continuous_chunks,
     is_continuity_active,
+    is_continuity_lead_segment,
     match_clip_to_gen_length,
     prepend_continuity_source,
     resolve_prev_segment_output,
@@ -127,14 +128,25 @@ def execute_director_plan_core(
             **meta,
         )
 
-        is_one_frame_i2v = seg.task_key == "i2v" and seg.source_clip is not None
+        is_one_frame_i2v = (
+            seg.task_key in {"i2v", "fl2v"} and seg.source_clip is not None
+        )
+        # fl2v endpoint source: full clip with first=image0, last=image1 (length already Wan-aligned).
+        fl2v_endpoint_source = (
+            seg.task_key == "fl2v"
+            and seg.source_clip is not None
+            and int(seg.source_clip.shape[0]) > 1
+        )
         # Per-segment gate: task must support continuity (v2v/rv2v/…) — never trim
         # t2v/r2v/gen heads just because the global checkbox is on.
         seg_continuity = is_continuity_active(plan, seg)
+        # Lead seg has no SCAIL, but still needs post-body source when continuity
+        # is on — otherwise Wan 4n+1 hollow-tails freeze right before the first cut.
+        lead_continuity = is_continuity_lead_segment(plan, seg) and not fl2v_endpoint_source
         # Continuity may need a few frames past the segment end so gen length
         # matches a fully-conditioned source canvas (avoids hollow-tail freeze).
         lookahead = 0
-        if seg_continuity and not is_one_frame_i2v:
+        if (seg_continuity or lead_continuity) and not is_one_frame_i2v:
             # Conditioning-only frames past the body so gen length is covered.
             lookahead = CONTINUITY_SOURCE_LOOKAHEAD
         raw_clip = resolve_segment_raw_clip_with_lookahead(
@@ -149,7 +161,12 @@ def execute_director_plan_core(
             else body_len
         )
         # Body-only clip for export length; lookahead stays in raw for conditioning.
-        body_raw = raw_clip[:target_len] if int(raw_clip.shape[0]) > target_len else raw_clip
+        # Do NOT trim fl2v endpoint sources — the last frame is the end-frame lock.
+        if fl2v_endpoint_source:
+            body_raw = seg.source_clip
+            target_len = int(seg.source_clip.shape[0])
+        else:
+            body_raw = raw_clip[:target_len] if int(raw_clip.shape[0]) > target_len else raw_clip
         if seg.source_clip is not None:
             clip_frames = body_raw
         elif plan.output_mode == "fixed":
@@ -158,7 +175,10 @@ def execute_director_plan_core(
             clip_frames = fit_video_long_edge(body_raw, plan.ref_max_size)
         # Length prep: official Studio = this segment only; continuity prepends prev-tail.
         prev_tail_output = None
-        if is_one_frame_i2v:
+        if fl2v_endpoint_source:
+            num_frames = int(clip_frames.shape[0])
+            prefix_trim = 0
+        elif is_one_frame_i2v:
             num_frames = wan_align_frame_count(target_len)
             prefix_trim = 0
         elif seg_continuity:
@@ -197,6 +217,24 @@ def execute_director_plan_core(
                 # Source must cover gen_frames; hollow tail → freeze / stutter near seams.
                 clip_frames = match_clip_to_gen_length(clip_frames, int(gen_frames))
             num_frames = int(gen_frames)
+        elif lead_continuity:
+            # First segment under continuity: no SCAIL prepend, but cover Wan align
+            # with real/mirrored post-body motion so the handoff tail is not frozen.
+            gen_frames = wan_align_frame_count(
+                max(1, int(target_len)) + CONTINUITY_SOURCE_LOOKAHEAD
+            )
+            prefix_trim = 0
+            clip_frames, _ = prepare_segment_clip(clip_frames, max(1, int(target_len)))
+            if needs_source_video(seg.task_key):
+                if int(raw_clip.shape[0]) > target_len:
+                    extra = raw_clip[target_len:]
+                    if plan.output_mode == "fixed":
+                        extra = fit_canvas(extra, plan.width, plan.height)
+                    else:
+                        extra = fit_video_long_edge(extra, plan.ref_max_size)
+                    clip_frames = torch.cat([clip_frames, extra], dim=0)
+                clip_frames = match_clip_to_gen_length(clip_frames, int(gen_frames))
+            num_frames = int(gen_frames)
         else:
             # Official Studio / Bernini single-clip path — no overlap padding.
             num_frames = wan_align_frame_count(max(1, int(target_len)))
@@ -228,12 +266,27 @@ def execute_director_plan_core(
                 reference_video=ref_video_pe,
             )
             if positive_prompt != original:
+                # fl2v: UI only stores the motion body — locks are re-applied at encode.
+                notify_text = positive_prompt
+                if seg.task_key == "fl2v":
+                    from .fl2v_timeline import fl2v_prompt_body_only
+
+                    notify_text = fl2v_prompt_body_only(positive_prompt) or original
                 notify_prompt_enhanced(
                     node_id,
-                    text=positive_prompt,
+                    text=notify_text,
                     segment_index=seg.index,
                     field="segment" if not seg.use_global else "global",
                 )
+
+        # fl2v: re-wrap PE output so first/last-frame constraints are never dropped.
+        if seg.task_key == "fl2v":
+            from .fl2v_timeline import reinforce_fl2v_prompt
+
+            has_end = any(getattr(r, "index", None) == 1 for r in (seg.refs or []))
+            if not has_end and seg.refs:
+                has_end = len(seg.refs) >= 2
+            positive_prompt = reinforce_fl2v_prompt(positive_prompt, has_end_frame=has_end)
 
         report_director_progress(
             node_id,
@@ -384,7 +437,11 @@ def execute_director_plan_core(
                 prefix_trim=prefix_trim,
                 target_len=target_len,
                 prev_tail=prev_tail_output,
+                segment_index=seg.index,
             )
+        elif lead_continuity and decoded.shape[0] > target_len:
+            # Drop conditioning-only lookahead; export the timeline body only.
+            decoded = decoded[:target_len]
         elif decoded.shape[0] > target_len:
             # Cut only — never pad with repeated last frames (visible stutter).
             decoded = decoded[:target_len]
@@ -405,7 +462,7 @@ def execute_director_plan_core(
                 )
             except Exception as exc:
                 log.debug("Segment preview skipped: %s", exc)
-        elif plan.global_task_key in {"t2v", "i2v", "r2v"} and decoded.shape[0] >= 1:
+        elif plan.global_task_key in {"t2v", "i2v", "r2v", "fl2v"} and decoded.shape[0] >= 1:
             try:
                 frames_b64 = [
                     tensor_frame_to_jpeg_b64(decoded[i])

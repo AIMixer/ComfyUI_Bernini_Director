@@ -15,12 +15,12 @@ from .plan import DirectorPlan
 
 
 def needs_source_video(task_key: str) -> bool:
-    return task_key in {"v2v", "rv2v", "vi2v", "vrc2v", "mv2v", "ads2v", "i2v", "i2i"}
+    return task_key in {"v2v", "rv2v", "vi2v", "vrc2v", "mv2v", "ads2v", "i2v", "i2i", "fl2v"}
 
 
 def is_gen_timeline_plan(plan: DirectorPlan) -> bool:
     mode = str((plan.raw or {}).get("timelineMode") or "").lower()
-    return mode in ("gen_blank", "gen_image", "prompt_batch", "image_batch")
+    return mode in ("gen_blank", "gen_image", "prompt_batch", "image_batch", "fl2v")
 
 
 def resolve_segment_raw_clip(plan: DirectorPlan, seg) -> torch.Tensor:

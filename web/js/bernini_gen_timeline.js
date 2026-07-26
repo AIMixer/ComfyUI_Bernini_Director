@@ -3,6 +3,7 @@
 export const IMAGE_BATCH_TASKS = new Set(["t2i", "i2i", "r2i"]);
 export const VIDEO_BATCH_TASKS = new Set(["t2v", "i2v", "r2v"]);
 export const PROMPT_BATCH_TASKS = new Set([...IMAGE_BATCH_TASKS, ...VIDEO_BATCH_TASKS]);
+export const FL2V_TASKS = new Set(["fl2v"]);
 
 /** Shown when task_type is i2v — Bernini upstream has no dedicated i2v testcase/demo. */
 export const I2V_EXPERIMENTAL_NOTICE =
@@ -36,6 +37,7 @@ export function isPromptBatchTask(taskKey) {
 
 export function getDirectorMode(taskTypeValue) {
     const key = resolveTaskKey(taskTypeValue);
+    if (FL2V_TASKS.has(key)) return "fl2v";
     if (PROMPT_BATCH_TASKS.has(key)) return "prompt_batch";
     return "video";
 }
@@ -68,13 +70,13 @@ export function taskUsesReferenceVideo(taskKey) {
 
 export function defaultFrameCount(taskKey) {
     if (isImageBatchTask(taskKey)) return 1;
-    if (isVideoBatchTask(taskKey)) return 81;
+    if (isVideoBatchTask(taskKey) || FL2V_TASKS.has(taskKey)) return 81;
     return 81;
 }
 
 export function minFrameCount(taskKey) {
     if (isImageBatchTask(taskKey)) return 1;
-    if (isVideoBatchTask(taskKey)) return 4;
+    if (isVideoBatchTask(taskKey) || FL2V_TASKS.has(taskKey)) return 4;
     return 4;
 }
 
@@ -93,6 +95,7 @@ export function genLayoutHint(taskKey) {
         case "t2v": return "文生视频 · 多组提示词 · 每组可设帧数 · 固定宽高 · 支持全部/分段导出 · 选择运行";
         case "r2v": return "参考主体生视频 · 每组最多 5 张参考图（img0–img4）· 每组可设帧数 · 支持全部/分段导出 · 选择运行";
         case "i2v": return "图生视频 · 实验性功能 · 单帧视频输入 · 每组可设帧数 · 支持全部/分段导出 · 选择运行";
+        case "fl2v": return "";
         default: return "";
     }
 }

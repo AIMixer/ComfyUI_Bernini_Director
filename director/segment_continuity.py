@@ -19,6 +19,10 @@ When continuity is **on** (WanSCAIL-style handoff on the official Bernini stack)
    replays the previous ending as duplicate frames at every cut)
 9. Do **not** inject a second full motion stream (that duplicated / shifted
    source_id channels and caused seam jumps + temporal stutter)
+10. Lead segment (index 0) still gets source lookahead when continuity is on,
+    so Wan 4n+1 does not invent a frozen tail used as the first handoff
+11. First handoff (seg index 1) uses a stronger last-frame opening nudge —
+    later joins already share an edited manifold and need less
 """
 
 from __future__ import annotations
@@ -57,6 +61,10 @@ CONTINUITY_LOCK_FEATHER_MASK = 0.35
 # prev's *last* frame only (no temporal replay).
 CONTINUITY_OPENING_LAST_FRAME_BLEND = 2
 CONTINUITY_OPENING_LAST_FRAME_WEIGHT = 0.25
+# First SCAIL join (seg #2) is the hardest: seg #1 had no lock and often ends
+# sticky; boost last-frame nudge only for that cut (not a sequence crossfade).
+CONTINUITY_FIRST_HANDOFF_BLEND = 5
+CONTINUITY_FIRST_HANDOFF_WEIGHT = 0.45
 
 
 def resolve_continuity_settings(timeline: dict, *, segment_count: int) -> tuple[bool, int]:
@@ -183,6 +191,16 @@ def is_continuity_active(plan: DirectorPlan, seg: SegmentPlan) -> bool:
         plan.continuity_enabled
         and plan.segment_count >= 2
         and seg.index > 0
+        and seg.task_key in CONTINUITY_TASK_KEYS
+    )
+
+
+def is_continuity_lead_segment(plan: DirectorPlan, seg: SegmentPlan) -> bool:
+    """First segment while continuity is on: no SCAIL, but avoid freeze-tail handoff."""
+    return (
+        plan.continuity_enabled
+        and plan.segment_count >= 2
+        and int(seg.index) == 0
         and seg.task_key in CONTINUITY_TASK_KEYS
     )
 
@@ -579,6 +597,7 @@ def trim_decoded_for_continuity(
     target_len: int,
     prev_tail: torch.Tensor | None = None,
     max_echo_skip: int = 0,
+    segment_index: int | None = None,
 ) -> torch.Tensor:
     """Drop SCAIL overlap prefix, optional last-frame nudge, keep body length.
 
@@ -603,7 +622,16 @@ def trim_decoded_for_continuity(
         guide = decoded[:prefix_trim]
 
     if guide is not None and int(out.shape[0]) > 0:
-        out = _blend_opening_toward_last_frame(out, guide)
+        # First handoff (timeline seg #2, index 1) gets a stronger nudge.
+        if segment_index is not None and int(segment_index) == 1:
+            out = _blend_opening_toward_last_frame(
+                out,
+                guide,
+                blend_frames=CONTINUITY_FIRST_HANDOFF_BLEND,
+                max_weight=CONTINUITY_FIRST_HANDOFF_WEIGHT,
+            )
+        else:
+            out = _blend_opening_toward_last_frame(out, guide)
     return out
 
 

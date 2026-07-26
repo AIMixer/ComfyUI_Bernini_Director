@@ -2,6 +2,7 @@
 
 import { api } from "../../scripts/api.js";
 import { resolveTaskKey, taskUsesReferenceImages, taskUsesReferenceVideo } from "./bernini_gen_timeline.js";
+import { stripFl2vPromptBody } from "./bernini_fl2v.js";
 
 export const PE_PANEL_COLLAPSED_H = 34;
 export const PE_PANEL_EXPANDED_H = 348;
@@ -734,8 +735,9 @@ export function mountPromptEnhancerPanel(editor, parentEl) {
         pe.setStatus(`正在扩写: ${label}…`, "loading");
         const result = await pe.callEnhanceApi(prompt, taskKey, block, cfg);
         if (result.ok) {
-            pe.setPromptTextForBlock(result.text, segmentIndex);
-            return { ok: true, chars: result.text.length, taskKey, result };
+            const text = taskKey === "fl2v" ? stripFl2vPromptBody(result.text) : result.text;
+            pe.setPromptTextForBlock(text, segmentIndex);
+            return { ok: true, chars: text.length, taskKey, result: { ...result, text } };
         }
         return { ok: false, error: result.error, taskKey };
     };
@@ -767,8 +769,9 @@ export function mountPromptEnhancerPanel(editor, parentEl) {
                     pe.visionBadge.style.display = "none";
                 }
                 if (result.ok) {
-                    pe.setActivePromptText(result.text);
-                    pe.setStatus(formatEnhanceSuccessStatus(taskKey, result), "success");
+                    const text = taskKey === "fl2v" ? stripFl2vPromptBody(result.text) : result.text;
+                    pe.setActivePromptText(text);
+                    pe.setStatus(formatEnhanceSuccessStatus(taskKey, { ...result, text }), "success");
                 } else {
                     pe.setStatus(result.error, "error");
                 }
@@ -875,8 +878,12 @@ export function mountPromptEnhancerPanel(editor, parentEl) {
     pe.onTaskTypeChanged = () => pe.fetchTemplate();
     pe.handleServerEnhanced = (payload) => {
         if (!payload || String(payload.node) !== String(editor.node.id)) return;
-        pe.setActivePromptText(payload.text || "");
-        pe.setStatus(`自动扩写已应用（${(payload.text || "").length} 字符）`, "success");
+        let text = payload.text || "";
+        if (editor.isFl2vMode?.() || resolveTaskKey(editor.getTaskKey?.() || "") === "fl2v") {
+            text = stripFl2vPromptBody(text);
+        }
+        pe.setActivePromptText(text);
+        pe.setStatus(`自动扩写已应用（${text.length} 字符）`, "success");
     };
 
     pe._lastOutputLanguage = null;

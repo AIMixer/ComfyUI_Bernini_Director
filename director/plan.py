@@ -304,6 +304,10 @@ def count_all_timeline_segments(timeline_data: str) -> int:
     segments = timeline.get("segments") or []
     global_task = (timeline.get("global") or {}).get("taskType") or ""
     task_key = resolve_task_key(global_task) if global_task else ""
+    if task_key == "fl2v" or str(timeline.get("timelineMode") or "").lower() == "fl2v":
+        from .fl2v_timeline import count_fl2v_runnable_shots
+
+        return count_fl2v_runnable_shots(timeline)
     if is_gen_timeline(timeline, task_key):
         return max(1, len(segments) or 1)
 
@@ -357,6 +361,19 @@ def build_director_plan(
     global_ref_video = _resolve_global_reference_video(timeline)
 
     task_key_early = resolve_task_key(task_type)
+    if task_key_early == "fl2v" or str(timeline.get("timelineMode") or "").lower() == "fl2v":
+        from .fl2v_timeline import build_fl2v_director_plan
+
+        return build_fl2v_director_plan(
+            timeline,
+            global_task_type=task_type,
+            global_prompt=prompt,
+            total_frames=total_frames,
+            frame_rate=frame_rate,
+            width=width,
+            height=height,
+            ref_max_size=ref_max_size,
+        )
     if is_gen_timeline(timeline, task_key_early):
         return build_gen_director_plan(
             timeline,
@@ -520,6 +537,7 @@ def prepare_segment_clip(clip: torch.Tensor, target_frames: int) -> tuple[torch.
 
 
 # v2v / mv2v / i2v / ads2v: no reference images in context_latents (ads2v uses reference_video).
+# fl2v intentionally keeps image0/image1 in context (first/last keyframes).
 CONTEXT_REFERENCE_EXCLUDED_KEYS = frozenset({"v2v", "mv2v", "i2v", "ads2v"})
 
 
@@ -553,8 +571,10 @@ def refs_to_kwargs_for_context(task_key: str, refs: list[SegmentRef]) -> dict[st
 
 def plan_summary(plan: DirectorPlan) -> str:
     mode = str(plan.raw.get("timelineMode") or "")
-    if mode in ("gen_blank", "gen_image", "prompt_batch", "image_batch"):
-        if mode in ("prompt_batch", "image_batch"):
+    if mode in ("gen_blank", "gen_image", "prompt_batch", "image_batch", "fl2v"):
+        if mode == "fl2v":
+            mode_label = "首尾帧 (fl2v)"
+        elif mode in ("prompt_batch", "image_batch"):
             mode_label = f"批量生成 ({plan.global_task_key})"
         else:
             mode_label = "空白画布" if mode == "gen_blank" else "图片生成"

@@ -28,6 +28,25 @@ import {
     wireBatchRunSelectControls,
 } from "./bernini_image_batch.js";
 import {
+    FL2V_STYLES,
+    bindFl2vEvents,
+    buildFl2vPayloadFields,
+    drawFl2vSegmentThumbnails,
+    ensureFl2vTimeline,
+    fl2vStartIndices,
+    getFl2vTotalFrames,
+    getFl2vUiHeight,
+    mountFl2vPanel,
+    normalizeFl2vSegments,
+    openFl2vReplace,
+    openFl2vUpload,
+    packFl2vSegments,
+    setFl2vToolbar,
+    flushFl2vPromptDraft,
+    updateFl2vDetailUI,
+    updateFl2vReplaceBtn,
+} from "./bernini_fl2v.js";
+import {
     getPromptEnhancerPanelHeight,
     mountPromptEnhancerPanel,
     registerDirectorPromptEnhancerEvents,
@@ -190,10 +209,10 @@ const STYLES = `
 .bd-frame-jump .bd-frame-input:focus{border-color:#4fff8f;outline:none}
 .bd-frame-jump .bd-frame-input::-webkit-outer-spin-button,.bd-frame-jump .bd-frame-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 .bd-frame-jump .bd-frame-total{color:#888;min-width:2.5em}
-.bd-controls{width:100%;box-sizing:border-box;background:#151515;border:1px solid #222;border-radius:0 0 6px 6px;padding:8px 10px;margin-top:0}
+.bd-controls{width:100%;box-sizing:border-box;background:#151515;border:1px solid #222;border-radius:0 0 6px 6px;padding:8px 10px;margin-top:0;flex-shrink:0}
 .bd-stage.hidden+.bd-controls{border-radius:6px;border-color:#333;background:#1e1e1e}
-.bd-viewport{width:100%;min-width:100%;overflow-x:auto;border-radius:6px;border:1px solid #111;background:#2a2a2a;box-sizing:border-box}
-.bd-canvas{display:block;width:100%;min-width:100%;cursor:pointer;box-sizing:border-box}
+.bd-viewport{width:100%;min-width:100%;overflow-x:auto;border-radius:6px;border:1px solid #111;background:#2a2a2a;box-sizing:border-box;flex-shrink:0}
+.bd-canvas{display:block;width:100%;min-width:100%;cursor:pointer;box-sizing:border-box;flex-shrink:0;object-fit:fill}
 .bd-canvas.bd-grab{cursor:grab}
 .bd-canvas.bd-grabbing{cursor:grabbing}
 .bd-output{width:100%;box-sizing:border-box;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 8px;background:#1e1e1e;border:1px solid #333;border-radius:6px}
@@ -284,6 +303,7 @@ const STYLES = `
 .bd-continuous-ref input[type="checkbox"]{width:14px;height:14px;margin:0;cursor:pointer;accent-color:#4fff8f}
 .bd-gen-fc-row{display:flex;align-items:center;gap:6px;margin-top:6px}
 ${IMAGE_BATCH_STYLES}
+${FL2V_STYLES}
 @media(max-width:480px){
 .bd-prompt-layout{grid-template-columns:1fr}
 .bd-ref{max-height:64px}
@@ -482,11 +502,15 @@ function getDirectorUiHeight(editor) {
     if (editor?.getDirectorMode?.() === "prompt_batch") {
         return getImageBatchUiHeight(editor) + 140 + peH;
     }
+    if (editor?.getDirectorMode?.() === "fl2v") {
+        return getFl2vUiHeight(editor) + 160 + peH;
+    }
     let h = (editor?.canvasHeight || RULER_H + SEG_LABEL_H + TRACK_H) + 370 + 52 + peH;
     if (
         editor?.hasVideo?.()
         && !editor?.isImageBatch?.()
         && !editor?.isGenMode?.()
+        && !editor?.isFl2vMode?.()
     ) {
         h += STAGE_PREVIEW_H + 10;
     }
@@ -705,6 +729,21 @@ function parseTimeline(raw, totalFrames, fps) {
         }
         data.runSelectEnabled = !!data.runSelectEnabled;
         data.runSelection = Array.isArray(data.runSelection) ? data.runSelection.map((i) => parseInt(i, 10)).filter((i) => i >= 0) : [];
+        if (data.timelineMode === "fl2v" || resolveTaskKey(data.global?.taskType || "") === "fl2v") {
+            data.timelineMode = "fl2v";
+            data.editMode = "segment";
+            data.keyframes = Array.isArray(data.keyframes) ? data.keyframes : [];
+            const stored = parseInt(data.totalFrames, 10);
+            const farthest = Math.max(
+                0,
+                ...(data.segments || []).map((s) => (parseInt(s.start, 10) || 0) + (parseInt(s.length ?? s.frameCount, 10) || 0)),
+                ...(data.keyframes || []).map((k) => (parseInt(k.start, 10) || 0) + (parseInt(k.frameCount ?? k.length, 10) || 0)),
+            );
+            data.totalFrames = (Number.isFinite(stored) && stored > 0)
+                ? stored
+                : Math.max(farthest, total, 240);
+            return data;
+        }
         if (data.timelineMode === "image_batch" || data.timelineMode === "prompt_batch") {
             data.timelineMode = "prompt_batch";
             data.editMode = "segment";
@@ -889,6 +928,30 @@ class BerniniDirectorEditor {
     }
 
     buildTimelinePayload() {
+        if (this.isFl2vMode()) {
+            const fl = buildFl2vPayloadFields(this);
+            const outMode = this.timeline.output?.mode || "long_edge";
+            const output = {
+                ...(this.timeline.output || {}),
+                mode: outMode,
+            };
+            const body = { ...this.timeline };
+            stripTimelineContinuityRootFields(body);
+            stripTimelineEphemeralFields(body);
+            return {
+                ...body,
+                version: 5,
+                ...fl,
+                frameRate: this.getFrameRate(),
+                global: {
+                    ...(this.timeline.global || {}),
+                    taskType: this.globalTask?.value || this.taskTypeWidget?.value || "",
+                    prompt: this.timeline.global?.prompt || "",
+                },
+                output,
+                ...this._runSelectionPayload(),
+            };
+        }
         if (this.isImageBatch()) {
             const taskKey = this.getTaskKey();
             const i2iSrc = (taskKey === "i2i" || taskKey === "i2v") ? this.getI2iSourceDimensions() : null;
@@ -1054,6 +1117,7 @@ class BerniniDirectorEditor {
             <div class="bd-toolbar">
                 <div class="bd-actions">
                     <button type="button" class="bd-btn bd-btn-primary" data-a="video">上传视频</button>
+                    <button type="button" class="bd-btn hidden" data-a="fl2v-replace" title="替换当前选中片段的图片">替换图片</button>
                     <button type="button" class="bd-btn" data-a="video-append" title="上传并追加到时间轴末尾，作为独立片段">追加视频</button>
                     <button type="button" class="bd-btn" data-a="split">+ 分割</button>
                     <input type="number" class="bd-num" data-r="equal-n" min="2" max="64" value="2" title="均分段数">
@@ -1142,6 +1206,10 @@ class BerniniDirectorEditor {
         const outputBar = document.createElement("div");
         outputBar.className = "bd-output";
         outputBar.innerHTML = `
+            <span class="bd-fl2v-total-wrap hidden" data-r="fl2v-total-wrap" title="首尾帧时间轴总长度；拖左右缘在此范围内调整各镜">
+                <label>总帧数</label>
+                <input type="number" class="bd-num" data-r="fl2v-total" min="4" max="${MAX_GEN_FRAMES}" step="1" value="240" style="width:64px">
+            </span>
             <label>输出分辨率</label>
             <select class="bd-select" data-r="out-mode" title="输出缩放模式">
                 <option value="long_edge">最长边缩放</option>
@@ -1247,6 +1315,13 @@ class BerniniDirectorEditor {
         this.batchAddBtn = batchUi.addBtn;
         wireBatchRunSelectControls(this, batchUi);
 
+        this.fl2vUi = mountFl2vPanel(this.mainBody);
+        this.fl2vTotalWrap = this.root.querySelector('[data-r="fl2v-total-wrap"]');
+        if (this.fl2vUi) {
+            this.fl2vUi.totalInput = this.root.querySelector('[data-r="fl2v-total"]');
+        }
+        bindFl2vEvents(this);
+
         // PE 始终紧跟在所有提示词区域之后（视频/生成 .bd-split，批量 t2i/i2i/i2v 等 .bd-batch）
         const peHost = document.createElement("div");
         peHost.className = "bd-pe-host";
@@ -1333,6 +1408,7 @@ class BerniniDirectorEditor {
         this.genSegFc = this.root.querySelector('[data-r="gen-seg-fc"]');
         this.controlsBar = this.root.querySelector(".bd-controls");
         this.btnVideo = this.root.querySelector('[data-a="video"]');
+        this.btnFl2vReplace = this.root.querySelector('[data-a="fl2v-replace"]');
         this.btnVideoAppend = this.root.querySelector('[data-a="video-append"]');
         this.outHint = this.root.querySelector('[data-r="out-hint"]');
         this.outMode = this.root.querySelector('[data-r="out-mode"]');
@@ -1386,6 +1462,7 @@ class BerniniDirectorEditor {
             el.onclick = (e) => { stopDomEvent(e); fn(); };
         };
         bind('[data-a="video"]', () => this.pickVideoFile());
+        bind('[data-a="fl2v-replace"]', () => openFl2vReplace(this));
         bind('[data-a="video-append"]', () => this.pickAppendVideoFile());
         bind('[data-a="split"]', () => this.splitAtFrame(this.currentFrame));
         bind('[data-a="equal"]', () => this.equalSplit());
@@ -1498,8 +1575,28 @@ class BerniniDirectorEditor {
         this.genSegFc?.addEventListener("change", () => this.onGenSegFcChange());
 
         this.canvas.addEventListener("mousedown", (e) => this.onMouseDown(e));
-        this.canvas.addEventListener("dblclick", (e) => this.addSplitAtMouse(e));
-        this.canvas.addEventListener("contextmenu", (e) => { e.preventDefault(); this.addSplitAtMouse(e); });
+        this.canvas.addEventListener("dblclick", (e) => {
+            if (this.isFl2vMode()) {
+                stopDomEvent(e);
+                e.preventDefault();
+                const { x, y } = this.getMousePos(e);
+                const hit = this.hitTest(x, y);
+                if (hit?.type === "segment" || hit?.type === "edge") {
+                    const idx = hit.index ?? this.selectedIndex;
+                    if (idx !== this.selectedIndex) flushFl2vPromptDraft(this);
+                    this.selectedIndex = idx;
+                    this.updateSelectionUI();
+                    openFl2vReplace(this, idx);
+                }
+                return;
+            }
+            this.addSplitAtMouse(e);
+        });
+        this.canvas.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            if (this.isFl2vMode()) return;
+            this.addSplitAtMouse(e);
+        });
         this._onMouseMove = (e) => this.onMouseMove(e);
         this._onMouseUp = () => this.onMouseUp();
         this._onCanvasHover = (e) => {
@@ -1509,11 +1606,26 @@ class BerniniDirectorEditor {
             this.canvas.classList.remove("bd-grab");
             if (hit?.type === "run-check" || hit?.type === "split") {
                 this.canvas.style.cursor = "pointer";
-            } else if (hit?.type === "segment" && this.timeline.segments.length >= 2) {
+            } else if (hit?.type === "edge") {
+                // Edge drag is always horizontal (change start/length); keep ↔ cursor.
+                this.canvas.style.cursor = "ew-resize";
+                if (this.isFl2vMode()) {
+                    const mid = TRACK_Y + TRACK_H / 2;
+                    this.canvas.title = y < mid
+                        ? "上半：调整前一段右缘"
+                        : "下半：调整后一段左缘";
+                } else {
+                    this.canvas.title = "";
+                }
+            } else if (hit?.type === "segment" && (this.isFl2vMode() || this.timeline.segments.length >= 2)) {
                 this.canvas.classList.add("bd-grab");
                 this.canvas.style.cursor = "";
+                this.canvas.title = this.isFl2vMode()
+                    ? "拖动：与其它图片交换位置（双击替换图片）"
+                    : "拖动：调整片段顺序";
             } else {
                 this.canvas.style.cursor = "";
+                this.canvas.title = "";
             }
         };
         window.addEventListener("mousemove", this._onMouseMove);
@@ -1522,6 +1634,7 @@ class BerniniDirectorEditor {
         this.canvas.addEventListener("mouseleave", () => {
             this.canvas.classList.remove("bd-grab");
             this.canvas.style.cursor = "";
+            this.canvas.title = "";
         });
 
         this.root.addEventListener("mouseenter", () => { this._isHovering = true; });
@@ -1686,6 +1799,7 @@ class BerniniDirectorEditor {
     }
 
     getRunnableSegmentCount() {
+        if (this.isFl2vMode()) return fl2vStartIndices(this).length;
         return this.timeline.segments?.length || 0;
     }
 
@@ -1694,6 +1808,7 @@ class BerniniDirectorEditor {
         if (n < 2) return false;
         const mode = this.getDirectorMode();
         if (mode === "video") return true;
+        if (mode === "fl2v") return true;
         if (this.isImageBatch()) return isPromptBatchTask(this.getTaskKey());
         return false;
     }
@@ -1710,8 +1825,16 @@ class BerniniDirectorEditor {
     }
 
     normalizeRunSelection() {
+        if (!this.isRunSelectEnabled()) return;
+        if (this.isFl2vMode()) {
+            const valid = new Set(fl2vStartIndices(this));
+            this.timeline.runSelection = [...new Set(
+                (this.timeline.runSelection || []).filter((i) => valid.has(i)),
+            )].sort((a, b) => a - b);
+            return;
+        }
         const n = this.getRunnableSegmentCount();
-        if (!this.isRunSelectEnabled() || n < 1) return;
+        if (n < 1) return;
         this.timeline.runSelection = [...new Set(
             (this.timeline.runSelection || []).filter((i) => i >= 0 && i < n),
         )].sort((a, b) => a - b);
@@ -1719,13 +1842,18 @@ class BerniniDirectorEditor {
 
     isSegmentRunEnabled(index) {
         if (!this.isRunSelectEnabled()) return true;
+        if (this.isFl2vMode() && !this.timeline.segments?.[index]?.isStartFrame) return false;
         return (this.timeline.runSelection || []).includes(index);
     }
 
     toggleSegmentRun(index) {
         if (!this.isRunSelectEnabled()) return;
-        const n = this.getRunnableSegmentCount();
-        if (index < 0 || index >= n) return;
+        if (this.isFl2vMode()) {
+            if (!this.timeline.segments?.[index]?.isStartFrame) return;
+        } else {
+            const n = this.getRunnableSegmentCount();
+            if (index < 0 || index >= n) return;
+        }
         const sel = new Set(this.timeline.runSelection || []);
         if (sel.has(index)) sel.delete(index);
         else sel.add(index);
@@ -1738,11 +1866,15 @@ class BerniniDirectorEditor {
 
     toggleRunSelectMode() {
         if (!this.supportsRunSelect()) return;
-        const n = this.getRunnableSegmentCount();
         this.timeline.runSelectEnabled = !this.timeline.runSelectEnabled;
         if (this.timeline.runSelectEnabled) {
             if (!(this.timeline.runSelection || []).length) {
-                this.timeline.runSelection = Array.from({ length: n }, (_, i) => i);
+                if (this.isFl2vMode()) {
+                    this.timeline.runSelection = fl2vStartIndices(this);
+                } else {
+                    const n = this.getRunnableSegmentCount();
+                    this.timeline.runSelection = Array.from({ length: n }, (_, i) => i);
+                }
             } else {
                 this.normalizeRunSelection();
             }
@@ -1755,6 +1887,13 @@ class BerniniDirectorEditor {
 
     setRunSelectionAll(on) {
         if (!this.isRunSelectEnabled()) return;
+        if (this.isFl2vMode()) {
+            this.timeline.runSelection = on ? fl2vStartIndices(this) : [];
+            this.updateRunSelectUI();
+            this.commit(false, { syncTimeline: true });
+            this.scheduleRender();
+            return;
+        }
         const n = this.getRunnableSegmentCount();
         this.timeline.runSelection = on ? Array.from({ length: n }, (_, i) => i) : [];
         this.updateRunSelectUI();
@@ -1806,8 +1945,15 @@ class BerniniDirectorEditor {
         }
     }
 
+    /** Drop live run-select flags (mode switch). Stashed workspaces keep their own copy. */
+    _clearLiveRunSelection() {
+        this.timeline.runSelectEnabled = false;
+        this.timeline.runSelection = [];
+    }
+
     _runSelectionPayload() {
-        if (!this.timeline.runSelectEnabled) {
+        // Never leak video-mode「选择运行」into i2v/batch (or vice versa).
+        if (!this.supportsRunSelect() || !this.timeline.runSelectEnabled) {
             return { runSelectEnabled: false, runSelection: [] };
         }
         this.normalizeRunSelection();
@@ -1823,7 +1969,7 @@ class BerniniDirectorEditor {
 
     isGenMode() {
         const mode = this.getDirectorMode();
-        return mode !== "video" && mode !== "prompt_batch";
+        return mode !== "video" && mode !== "prompt_batch" && mode !== "fl2v";
     }
 
     isImageBatch() {
@@ -1837,6 +1983,10 @@ class BerniniDirectorEditor {
 
     isGenImage() {
         return this.getDirectorMode() === "gen_image";
+    }
+
+    isFl2vMode() {
+        return this.getDirectorMode() === "fl2v";
     }
 
     onTaskTypeChanged(value) {
@@ -2062,21 +2212,82 @@ class BerniniDirectorEditor {
         if (showGlobalRefVideo || showSegRefVideo) this.renderRefVideoSlot();
     }
 
+    _stashFl2vWorkspace() {
+        const segs = this.timeline.segments || [];
+        const keys = this.timeline.keyframes || [];
+        if (!segs.length && !keys.length) return;
+        this.timeline.fl2vWorkspace = {
+            segments: JSON.parse(JSON.stringify(segs)),
+            keyframes: JSON.parse(JSON.stringify(keys)),
+            selectedIndex: this.selectedIndex,
+            runSelectEnabled: !!this.timeline.runSelectEnabled,
+            runSelection: Array.isArray(this.timeline.runSelection)
+                ? [...this.timeline.runSelection]
+                : [],
+            output: this.timeline.output
+                ? JSON.parse(JSON.stringify(this.timeline.output))
+                : undefined,
+        };
+    }
+
+    _restoreFl2vWorkspace() {
+        const ws = this.timeline.fl2vWorkspace;
+        if (!ws) return false;
+        const hasSegs = Array.isArray(ws.segments) && ws.segments.length;
+        const hasKeys = Array.isArray(ws.keyframes) && ws.keyframes.length;
+        if (!hasSegs && !hasKeys) return false;
+        if (hasSegs) this.timeline.segments = JSON.parse(JSON.stringify(ws.segments));
+        if (hasKeys) this.timeline.keyframes = JSON.parse(JSON.stringify(ws.keyframes));
+        if (ws.selectedIndex != null) this.selectedIndex = ws.selectedIndex;
+        if (ws.runSelectEnabled != null) this.timeline.runSelectEnabled = !!ws.runSelectEnabled;
+        if (Array.isArray(ws.runSelection)) this.timeline.runSelection = [...ws.runSelection];
+        if (ws.output && typeof ws.output === "object") {
+            this.timeline.output = { ...(this.timeline.output || {}), ...JSON.parse(JSON.stringify(ws.output)) };
+        }
+        this.timeline.fl2vWorkspace = null;
+        return true;
+    }
+
     applyTaskLayout(prevMode) {
         const mode = this.getDirectorMode();
         const prev = prevMode || "video";
         const wasBatch = prev === "prompt_batch" || prev === "image_batch";
         const isBatch = mode === "prompt_batch";
-        const wasGen = prev !== "video" && prev !== "prompt_batch" && prev !== "image_batch";
-        const isGen = mode !== "video" && mode !== "prompt_batch";
+        const wasFl2v = prev === "fl2v";
+        const isFl2v = mode === "fl2v";
+        const wasGen = prev !== "video" && prev !== "prompt_batch" && prev !== "image_batch" && prev !== "fl2v";
+        const isGen = mode !== "video" && mode !== "prompt_batch" && mode !== "fl2v";
 
         if (this.isPlaying) this._stopPlay();
 
-        if (isBatch) {
+        if (isFl2v) {
+            if (prev === "video") {
+                this._stashVideoWorkspace();
+                this._clearLiveRunSelection();
+            } else if (wasBatch) {
+                this._stashBatchWorkspace();
+                this._clearLiveRunSelection();
+            }
+            if (!this._restoreFl2vWorkspace()) {
+                ensureFl2vTimeline(this);
+                this._clearLiveRunSelection();
+            } else {
+                ensureFl2vTimeline(this);
+            }
+        } else if (isBatch) {
             if (!wasBatch) {
+                if (wasFl2v) {
+                    this._stashFl2vWorkspace();
+                    this._clearLiveRunSelection();
+                }
                 // Keep v2v/rv2v video + segments so switching back can restore them.
-                if (prev === "video") this._stashVideoWorkspace();
-                // Prefer restoring the previous r2v/r2i batch (prompts + refs).
+                // Run-select is per workspace: stash video's, then clear live so i2v/batch
+                // does not inherit「选择运行」from rv2v.
+                if (prev === "video") {
+                    this._stashVideoWorkspace();
+                    this._clearLiveRunSelection();
+                }
+                // Prefer restoring the previous r2v/r2i/i2v batch (prompts + its own run-select).
                 if (!this._restoreBatchWorkspace()) {
                     const keep = this.timeline.global?.prompt
                         || this.timeline.segments?.[0]?.prompt
@@ -2089,13 +2300,24 @@ class BerniniDirectorEditor {
                         negativePrompt: this.negativePromptWidget?.value || "bad video",
                         refs: keepRefs,
                     })];
+                    this._clearLiveRunSelection();
                 }
             }
             ensureImageBatchTimeline(this);
         } else if (isGen) {
-            if (wasBatch) this._stashBatchWorkspace();
-            if (!wasGen && !wasBatch) {
-                if (prev === "video") this._stashVideoWorkspace();
+            if (wasBatch) {
+                this._stashBatchWorkspace();
+                this._clearLiveRunSelection();
+            }
+            if (wasFl2v) {
+                this._stashFl2vWorkspace();
+                this._clearLiveRunSelection();
+            }
+            if (!wasGen && !wasBatch && !wasFl2v) {
+                if (prev === "video") {
+                    this._stashVideoWorkspace();
+                    this._clearLiveRunSelection();
+                }
                 const key = this.getTaskKey();
                 const defFc = defaultFrameCount(key);
                 const keepPrompt = this.timeline.global?.prompt || "";
@@ -2112,31 +2334,53 @@ class BerniniDirectorEditor {
             }
             this.ensureGenTimeline();
         } else if (prev !== "video") {
-            // Leaving batch/gen for video — stash batch groups before video restore
-            // overwrites timeline.segments (fixes r2v → rv2v → r2v wiping refs/prompts).
-            if (wasBatch) this._stashBatchWorkspace();
+            // Leaving batch/gen/fl2v for video — stash before video restore.
+            if (wasBatch) {
+                this._stashBatchWorkspace();
+                this._clearLiveRunSelection();
+            }
+            if (wasFl2v) {
+                this._stashFl2vWorkspace();
+                this._clearLiveRunSelection();
+            }
             this.timeline.timelineMode = "video";
-            // Prefer restoring the stashed v2v/rv2v session (segments + thumbs source).
+            // Prefer restoring the stashed v2v/rv2v session (segments + thumbs + run-select).
             if (!this._restoreVideoWorkspace()) {
                 this.normalizeSegments();
+                this._clearLiveRunSelection();
             }
         }
         this.timeline.timelineMode = mode;
         this._directorMode = mode;
 
+        // fl2v uses the main timeline track (like LTX Director); only batch/gen hide it.
         const hideTimeline = isBatch || isGen;
         const taskKey = this.getTaskKey();
-        const showBatchExport = isBatch && isVideoBatchTask(taskKey);
-        this.btnVideo?.classList.toggle("hidden", hideTimeline);
-        this.btnVideoAppend?.classList.toggle("hidden", hideTimeline);
-        this.controlsBar?.classList.toggle("hidden", hideTimeline || isBatch);
-        this.boundsEl?.classList.toggle("hidden", hideTimeline || isBatch);
-        this.timecodeEl?.classList.toggle("hidden", hideTimeline || isBatch);
+        const showBatchExport = (isBatch && isVideoBatchTask(taskKey)) || isFl2v;
+        this.btnVideo?.classList.toggle("hidden", hideTimeline && !isFl2v);
+        this.btnVideoAppend?.classList.toggle("hidden", hideTimeline || isFl2v);
+        this.controlsBar?.classList.toggle("hidden", (hideTimeline || isBatch) && !isFl2v);
+        this.boundsEl?.classList.toggle("hidden", (hideTimeline || isBatch) && !isFl2v);
+        this.timecodeEl?.classList.toggle("hidden", (hideTimeline || isBatch) && !isFl2v);
         this.viewport?.classList.toggle("hidden", isBatch);
         this.updateStageVisibility();
-        this.root.querySelector(".bd-split")?.classList.toggle("hidden", isBatch);
+        this.root.querySelector(".bd-split")?.classList.toggle("hidden", isBatch || isFl2v);
         this.batchPanel?.classList.toggle("hidden", !isBatch);
-        setToolbarDisabledForBatch(this, isBatch);
+        this.fl2vUi?.root?.classList.toggle("hidden", !isFl2v);
+        this.fl2vTotalWrap?.classList.toggle("hidden", !isFl2v);
+        if (isFl2v) {
+            setFl2vToolbar(this, true);
+            setToolbarDisabledForBatch(this, false);
+            // Re-apply fl2v-specific disables after clearing batch disables.
+            setFl2vToolbar(this, true);
+        } else {
+            setFl2vToolbar(this, false);
+            setToolbarDisabledForBatch(this, isBatch);
+            if (this.btnVideo) this.btnVideo.textContent = "上传视频";
+            const del = this.root?.querySelector('[data-a="del"]');
+            if (del) del.textContent = "删除片段";
+            updateFl2vReplaceBtn(this);
+        }
 
         this.updateReferenceImageVisibility({ hideTimeline });
 
@@ -2178,25 +2422,31 @@ class BerniniDirectorEditor {
         }
 
         if (this.outHint) {
-            this.outHint.classList.toggle("hidden", !isGen && !isBatch);
-            this.outHint.textContent = (isGen || isBatch) ? genLayoutHint(this.getTaskKey()) : "";
+            this.outHint.classList.toggle("hidden", !isGen && !isBatch && !isFl2v);
+            this.outHint.textContent = (isGen || isBatch || isFl2v) ? genLayoutHint(this.getTaskKey()) : "";
         }
         if (this.outExportMode) {
-            this.outExportMode.disabled = isBatch && !showBatchExport;
-            this.outExportMode.classList.toggle("hidden", isBatch && !showBatchExport);
-            this.outExportMode.previousElementSibling?.classList.toggle("hidden", isBatch && !showBatchExport);
+            this.outExportMode.disabled = (isBatch || isFl2v) && !showBatchExport;
+            this.outExportMode.classList.toggle("hidden", (isBatch || isFl2v) && !showBatchExport);
+            this.outExportMode.previousElementSibling?.classList.toggle("hidden", (isBatch || isFl2v) && !showBatchExport);
         }
         if (this.outMaxFrames) {
-            this.outMaxFrames.disabled = isBatch && !showBatchExport;
-            this.outMaxFrames.classList.toggle("hidden", isBatch && !showBatchExport);
-            this.outMaxFrames.previousElementSibling?.classList.toggle("hidden", isBatch && !showBatchExport);
+            this.outMaxFrames.disabled = (isBatch || isFl2v) && !showBatchExport;
+            this.outMaxFrames.classList.toggle("hidden", (isBatch || isFl2v) && !showBatchExport);
+            this.outMaxFrames.previousElementSibling?.classList.toggle("hidden", (isBatch || isFl2v) && !showBatchExport);
         }
 
-        if ((isGen || isBatch) && prev === "video") {
+        if ((isGen || isBatch || isFl2v) && prev === "video") {
             this.currentFrame = 0;
         }
         this.updateVideoNameLabel();
-        if (isBatch) {
+        if (isFl2v) {
+            this.timeline.editMode = "segment";
+            ensureFl2vTimeline(this);
+            this.updateSelectionUI();
+            updateFl2vDetailUI(this);
+            this.updateVideoNameLabel();
+        } else if (isBatch) {
             this.timeline.editMode = "segment";
             this.renderImageBatchGroups();
         } else {
@@ -2452,6 +2702,19 @@ class BerniniDirectorEditor {
     }
 
     updateVideoNameLabel() {
+        if (this.isFl2vMode()) {
+            const segs = this.timeline.segments || [];
+            const n = segs.length;
+            const total = this.getTotalFrames();
+            const starts = segs.filter((s) => s.isStartFrame).length;
+            const ends = segs.filter((s) => s.isEndFrame).length;
+            if (!n) {
+                this.videoNameEl.textContent = `未上传图片 · 总帧数 ${total}`;
+            } else {
+                this.videoNameEl.textContent = `${n} 张图 · ${starts} 首帧 · ${ends} 尾帧 · 总 ${total} 帧`;
+            }
+            return;
+        }
         if (this.isImageBatch()) {
             const n = this.timeline.segments?.length || 0;
             const key = this.getTaskKey();
@@ -2596,6 +2859,30 @@ class BerniniDirectorEditor {
 
     _computeReorderDropRank(frame, fromRank) {
         const ordered = this._orderedSegmentsWithRank();
+        if (!ordered.length) return fromRank;
+
+        // fl2v: swap slots — drop target = the clip currently under the pointer.
+        if (this.isFl2vMode()) {
+            for (const item of ordered) {
+                const lo = item.seg.start;
+                const hi = item.seg.start + item.seg.length;
+                if (frame >= lo && frame < hi) return item.visualRank;
+            }
+            // In a gap / past the end: snap to nearest clip by center distance.
+            let best = fromRank;
+            let bestDist = Infinity;
+            for (const item of ordered) {
+                const mid = item.seg.start + item.seg.length / 2;
+                const d = Math.abs(frame - mid);
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = item.visualRank;
+                }
+            }
+            return best;
+        }
+
+        // Video / gen: insert-before semantics (skip the dragged clip).
         for (const item of ordered) {
             if (item.visualRank === fromRank) continue;
             const mid = item.seg.start + item.seg.length / 2;
@@ -2611,6 +2898,36 @@ class BerniniDirectorEditor {
         if (fromRank < 0 || fromRank >= ordered.length) return;
         if (toRank < 0 || toRank >= ordered.length) return;
         if (fromRank === toRank) return;
+
+        // fl2v/gen: no video frameMap — reorder by segment metadata only.
+        if (this.isFl2vMode() || this.isGenMode()) {
+            const metas = ordered.map((o) => ({
+                ...o.seg,
+                refs: o.seg.refs ? JSON.parse(JSON.stringify(o.seg.refs)) : [],
+            }));
+            // Keep timeline slots (start/length); move image content between them.
+            const slots = ordered.map((o) => ({
+                start: o.seg.start,
+                length: o.seg.length || o.seg.frameCount || minFrameCount(this.getTaskKey()),
+            }));
+            const [mMeta] = metas.splice(fromRank, 1);
+            let insertRank = toRank;
+            if (insertRank > fromRank) insertRank -= 1;
+            metas.splice(insertRank, 0, mMeta);
+            for (let i = 0; i < metas.length; i++) {
+                const slot = slots[i] || slots[slots.length - 1];
+                metas[i].start = slot.start;
+                metas[i].length = slot.length;
+                metas[i].frameCount = slot.length;
+            }
+            this.timeline.segments = metas;
+            if (this.isFl2vMode()) packFl2vSegments(this);
+            else this.normalizeGenSegments();
+            this.selectedIndex = insertRank;
+            if (this.isFl2vMode()) updateFl2vDetailUI(this);
+            this.updateVideoNameLabel();
+            return;
+        }
 
         if (!this.getFrameMap().length && this.getTotalFrames() > 0) {
             this.materializeFrameMap();
@@ -2688,7 +3005,10 @@ class BerniniDirectorEditor {
     }
 
     getTotalFrames() {
-        if (this.isImageBatch() || this.isGenMode()) return sumFrameCounts(this.timeline.segments);
+        if (this.isFl2vMode()) return getFl2vTotalFrames(this);
+        if (this.isImageBatch() || this.isGenMode()) {
+            return sumFrameCounts(this._previewSegments || this.timeline.segments);
+        }
         const mapLen = this.timeline?.video?.frameMap?.length || 0;
         if (mapLen > 0) return mapLen;
         // Sparse deletes: sourceFrameCount − ranges beats a stale totalFrames.
@@ -3185,6 +3505,12 @@ class BerniniDirectorEditor {
             this.normalizeImageBatchSegments();
             return;
         }
+        if (this.isFl2vMode()) {
+            normalizeFl2vSegments(this);
+            const n = this.timeline.segments?.length || 0;
+            this.selectedIndex = clamp(this.selectedIndex, 0, Math.max(0, n - 1));
+            return;
+        }
         if (this.isGenMode()) {
             this.normalizeGenSegments();
             return;
@@ -3301,7 +3627,8 @@ class BerniniDirectorEditor {
         if (!this.stageEl) return;
         const show = this.hasVideo()
             && !this.isImageBatch()
-            && !this.isGenMode();
+            && !this.isGenMode()
+            && !this.isFl2vMode();
         this.stageEl.classList.toggle("hidden", !show);
         if (!show) {
             if (this.stageVideo) {
@@ -3650,6 +3977,10 @@ class BerniniDirectorEditor {
     }
 
     pickVideoFile() {
+        if (this.isFl2vMode()) {
+            openFl2vUpload(this);
+            return;
+        }
         const input = document.createElement("input");
         input.type = "file"; input.accept = "video/*";
         input.onchange = () => { if (input.files?.[0]) this.loadVideoFile(input.files[0]); };
@@ -4090,6 +4421,95 @@ class BerniniDirectorEditor {
         };
     }
 
+    /** Draw fl2v edge grips; joints are split (top=prev yellow, bottom=next cyan). */
+    _drawFl2vEdgeHandles(segs, index, x0, x1, width) {
+        const ordered = (segs || [])
+            .map((seg, i) => ({ seg, i }))
+            .sort((a, b) => a.seg.start - b.seg.start || a.i - b.i);
+        const rank = ordered.findIndex((o) => o.i === index);
+        if (rank < 0) return;
+        const prev = rank > 0 ? ordered[rank - 1] : null;
+        const next = rank < ordered.length - 1 ? ordered[rank + 1] : null;
+        const prevX1 = prev
+            ? this.frameToX(prev.seg.start + prev.seg.length, width)
+            : null;
+        const nextX0 = next ? this.frameToX(next.seg.start, width) : null;
+        const jointLeft = prev != null && Math.abs(prevX1 - x0) <= 2;
+        const jointRight = next != null && Math.abs(nextX0 - x1) <= 2;
+        const mid = TRACK_Y + TRACK_H / 2;
+        const half = Math.max(10, TRACK_H / 2 - 6);
+
+        if (!jointLeft) {
+            this.ctx.fillStyle = "#ffcc00";
+            this.ctx.fillRect(x0 - 2, mid - 12, 4, 24);
+        }
+        if (jointRight) {
+            // Draw once on the left segment of the joint.
+            this.ctx.fillStyle = "#ffcc00";
+            this.ctx.fillRect(x1 - 2, TRACK_Y + 4, 4, half);
+            this.ctx.fillStyle = "#5ec8ff";
+            this.ctx.fillRect(x1 - 2, mid + 2, 4, half);
+            this.ctx.fillStyle = "rgba(255,255,255,0.85)";
+            this.ctx.fillRect(x1 - 3, mid - 1, 6, 2);
+        } else {
+            this.ctx.fillStyle = "#ffcc00";
+            this.ctx.fillRect(x1 - 2, mid - 12, 4, 24);
+        }
+    }
+
+    /**
+     * fl2v joint handles: top half → previous clip's right edge;
+     * bottom half → next clip's left edge. Solves "always drags the left clip".
+     */
+    _hitTestFl2vEdge(x, y, width, segs) {
+        const ordered = (segs || [])
+            .map((seg, index) => ({ seg, index }))
+            .sort((a, b) => a.seg.start - b.seg.start || a.index - b.index);
+        if (!ordered.length) return null;
+        const trackMid = TRACK_Y + TRACK_H / 2;
+        const preferNext = y >= trackMid;
+        let best = null;
+        let bestDist = HANDLE_PX + 1;
+
+        for (let r = 0; r < ordered.length; r++) {
+            const { seg, index } = ordered[r];
+            const x0 = this.frameToX(seg.start, width);
+            const x1 = this.frameToX(seg.start + seg.length, width);
+            const prev = r > 0 ? ordered[r - 1] : null;
+            const next = r < ordered.length - 1 ? ordered[r + 1] : null;
+            const prevX1 = prev
+                ? this.frameToX(prev.seg.start + prev.seg.length, width)
+                : null;
+            const nextX0 = next ? this.frameToX(next.seg.start, width) : null;
+            const jointLeft = prev != null && Math.abs(prevX1 - x0) <= 2;
+            const jointRight = next != null && Math.abs(nextX0 - x1) <= 2;
+
+            const d0 = Math.abs(x - x0);
+            if (d0 <= HANDLE_PX && d0 < bestDist) {
+                if (jointLeft) {
+                    best = preferNext
+                        ? { type: "edge", index, edge: "left" }
+                        : { type: "edge", index: prev.index, edge: "right" };
+                } else {
+                    best = { type: "edge", index, edge: "left" };
+                }
+                bestDist = d0;
+            }
+            const d1 = Math.abs(x - x1);
+            if (d1 <= HANDLE_PX && d1 < bestDist) {
+                if (jointRight) {
+                    best = preferNext
+                        ? { type: "edge", index: next.index, edge: "left" }
+                        : { type: "edge", index, edge: "right" };
+                } else {
+                    best = { type: "edge", index, edge: "right" };
+                }
+                bestDist = d1;
+            }
+        }
+        return best;
+    }
+
     hitTest(x, y) {
         const width = this.getLayoutWidth();
         if (!width) return null;
@@ -4104,8 +4524,9 @@ class BerniniDirectorEditor {
 
         // Checkbox corner wins over generic segment hit (same toggle action either way
         // in run-select mode; keeps hit type accurate for cursor / future hooks).
-        if (this.isRunSelectEnabled() && segs.length >= 2 && y >= TRACK_Y && y <= trackBottom) {
+        if (this.isRunSelectEnabled() && this.getRunnableSegmentCount() >= 2 && y >= TRACK_Y && y <= trackBottom) {
             for (let i = segs.length - 1; i >= 0; i--) {
+                if (this.isFl2vMode() && !segs[i]?.isStartFrame) continue;
                 const g = this._runCheckGeometry(segs[i], width);
                 if (x >= g.hitX0 && x <= g.hitX1 && y >= g.hitY0 && y <= g.hitY1) {
                     return { type: "run-check", index: i };
@@ -4132,6 +4553,22 @@ class BerniniDirectorEditor {
 
         if (y < TRACK_Y) return null;
 
+        // Edge handles first so fl2v/gen can drag-extend duration (repeat thumbs).
+        if (y >= TRACK_Y && y <= trackBottom) {
+            if (this.isFl2vMode()) {
+                const flHit = this._hitTestFl2vEdge(x, y, width, segs);
+                if (flHit) return flHit;
+            } else {
+                for (let i = 0; i < segs.length; i++) {
+                    const seg = segs[i];
+                    const x0 = this.frameToX(seg.start, width);
+                    const x1 = this.frameToX(seg.start + seg.length, width);
+                    if (Math.abs(x - x0) <= HANDLE_PX) return { type: "edge", index: i, edge: "left" };
+                    if (Math.abs(x - x1) <= HANDLE_PX) return { type: "edge", index: i, edge: "right" };
+                }
+            }
+        }
+
         for (let i = segs.length - 1; i >= 0; i--) {
             const seg = segs[i];
             const x0 = this.frameToX(seg.start, width);
@@ -4141,15 +4578,6 @@ class BerniniDirectorEditor {
             if (insideX && y >= TRACK_Y && y <= trackBottom) {
                 return { type: "segment", index: i };
             }
-        }
-
-        for (let i = 0; i < segs.length; i++) {
-            const seg = segs[i];
-            const x0 = this.frameToX(seg.start, width);
-            const x1 = this.frameToX(seg.start + seg.length, width);
-            if (y < TRACK_Y || y > trackBottom) continue;
-            if (Math.abs(x - x0) <= HANDLE_PX) return { type: "edge", index: i, edge: "left" };
-            if (Math.abs(x - x1) <= HANDLE_PX) return { type: "edge", index: i, edge: "right" };
         }
 
         if (Math.abs(x - phx) <= HANDLE_PX) return { type: "playhead" };
@@ -4163,7 +4591,17 @@ class BerniniDirectorEditor {
         e.preventDefault();
         const { x, y } = this.getMousePos(e);
         const hit = this.hitTest(x, y);
-        if (!hit) return;
+        if (!hit) {
+            if (
+                this.isFl2vMode()
+                && !(this.timeline.segments || []).length
+                && y >= TRACK_Y
+                && y <= TRACK_Y + TRACK_H
+            ) {
+                openFl2vUpload(this);
+            }
+            return;
+        }
         const width = this.getLayoutWidth();
         if (hit.type === "playhead" || hit.type === "ruler") {
             this.currentFrame = this.xToFrame(x, width);
@@ -4176,10 +4614,14 @@ class BerniniDirectorEditor {
             this.selectSplitFrame(hit.frame);
             this._drag = null;
         } else if (hit.type === "segment") {
+            if (this.isFl2vMode() && hit.index !== this.selectedIndex) {
+                flushFl2vPromptDraft(this);
+            }
             this.selectedIndex = hit.index;
             this.clearSplitSelection();
             this.updateSelectionUI();
-            if (this.timeline.segments.length >= 2) {
+            if (this.isFl2vMode() || this.timeline.segments.length >= 2) {
+                // Drag body to reorder / swap clip positions; edges still resize.
                 this._drag = {
                     kind: "segment-pending",
                     index: hit.index,
@@ -4191,6 +4633,9 @@ class BerniniDirectorEditor {
                 this._drag = { kind: "segment" };
             }
         } else if (hit.type === "edge") {
+            if (this.isFl2vMode() && hit.index !== this.selectedIndex) {
+                flushFl2vPromptDraft(this);
+            }
             this.selectedIndex = hit.index;
             this.clearSplitSelection();
             this.updateSelectionUI();
@@ -4212,10 +4657,15 @@ class BerniniDirectorEditor {
                     kind: "reorder",
                     fromRank: this._drag.fromRank,
                     index: this._drag.index,
+                    pointerX: x,
+                    pointerY: y,
+                    originX: this._drag.x0,
+                    originY: this._drag.y0,
                 };
                 this._reorderFromRank = this._drag.fromRank;
                 this._reorderDropRank = this._drag.fromRank;
                 this.canvas.classList.add("bd-grabbing");
+                this.canvas.style.cursor = "grabbing";
             }
             return;
         }
@@ -4223,29 +4673,92 @@ class BerniniDirectorEditor {
         if (this._drag.kind === "playhead") {
             this.currentFrame = frame;
         } else if (this._drag.kind === "reorder") {
+            this._drag.pointerX = x;
+            this._drag.pointerY = y;
             this._reorderDropRank = this._computeReorderDropRank(frame, this._drag.fromRank);
             this.scheduleRender();
             return;
+        } else if (this._drag.kind === "fl2v-move") {
+            const segs = (this._previewSegments || this.timeline.segments).map((s) => ({ ...s }));
+            const i = this._drag.index;
+            const seg = segs[i];
+            if (!seg) return;
+            const total = getFl2vTotalFrames(this);
+            const minLen = minFrameCount("fl2v");
+            const width = this.getLayoutWidth();
+            const frame0 = this.xToFrame(this._drag.x0, width);
+            const delta = frame - frame0;
+            const ordered = [...segs].sort((a, b) => a.start - b.start);
+            const rank = ordered.findIndex((s) => s.id === seg.id);
+            const prev = rank > 0 ? ordered[rank - 1] : null;
+            const next = rank >= 0 && rank < ordered.length - 1 ? ordered[rank + 1] : null;
+            const minStart = prev ? prev.start + prev.length : 0;
+            const maxStart = next
+                ? next.start - seg.length
+                : total - seg.length;
+            seg.start = clamp(this._drag.start0 + delta, minStart, Math.max(minStart, maxStart));
+            seg.length = Math.max(minLen, this._drag.length0);
+            seg.frameCount = seg.length;
+            this._previewSegments = segs;
         } else if (this._drag.kind === "edge") {
             const segs = this._edgeSnapshot.map((s) => ({ ...s }));
             const i = this._drag.index;
             const seg = segs[i];
-            if (this._drag.edge === "left") {
+            const isFl2v = this.isFl2vMode();
+            const isGen = this.isGenMode();
+            const minLen = (isFl2v || isGen) ? minFrameCount(this.getTaskKey()) : MIN_SEG;
+            if (isFl2v) {
+                // LTX-style: resize self only; do not steal from neighbors.
+                const total = getFl2vTotalFrames(this);
+                const ordered = [...segs].sort((a, b) => a.start - b.start);
+                const rank = ordered.findIndex((s) => s.id === seg.id);
+                const prev = rank > 0 ? ordered[rank - 1] : null;
+                const next = rank >= 0 && rank < ordered.length - 1 ? ordered[rank + 1] : null;
+                if (this._drag.edge === "left") {
+                    const right = this._edgeSnapshot[i].start + this._edgeSnapshot[i].length;
+                    const minStart = prev ? prev.start + prev.length : 0;
+                    const maxStart = right - minLen;
+                    const newStart = clamp(frame, minStart, maxStart);
+                    seg.start = newStart;
+                    seg.length = right - newStart;
+                    seg.frameCount = seg.length;
+                } else {
+                    const minEnd = seg.start + minLen;
+                    const maxEnd = next ? next.start : total;
+                    const end = clamp(frame, minEnd, maxEnd);
+                    seg.length = end - seg.start;
+                    seg.frameCount = seg.length;
+                }
+            } else if (this._drag.edge === "left") {
                 const prev = segs[i - 1];
-                const minStart = prev ? prev.start + MIN_SEG : 0;
-                const maxStart = seg.start + seg.length - MIN_SEG;
+                const minStart = prev ? prev.start + minLen : 0;
+                const maxStart = seg.start + seg.length - minLen;
                 seg.start = clamp(frame, minStart, maxStart);
                 seg.length = (this._edgeSnapshot[i].start + this._edgeSnapshot[i].length) - seg.start;
-                if (prev) prev.length = seg.start - prev.start;
+                if (isGen) seg.frameCount = seg.length;
+                if (prev) {
+                    prev.length = seg.start - prev.start;
+                    if (isGen) prev.frameCount = prev.length;
+                }
             } else {
                 const next = segs[i + 1];
-                const minEnd = seg.start + MIN_SEG;
-                const maxEnd = next ? next.start + next.length : this.getTotalFrames();
+                const minEnd = seg.start + minLen;
+                let maxEnd;
+                if (next) {
+                    maxEnd = this._edgeSnapshot[i + 1].start + this._edgeSnapshot[i + 1].length;
+                    if (isGen) maxEnd -= minLen;
+                } else if (isGen) {
+                    maxEnd = seg.start + MAX_GEN_FRAMES;
+                } else {
+                    maxEnd = this.getTotalFrames();
+                }
                 const end = clamp(frame, minEnd, maxEnd);
                 seg.length = end - seg.start;
+                if (isGen) seg.frameCount = seg.length;
                 if (next) {
                     next.start = end;
                     next.length = (this._edgeSnapshot[i + 1].start + this._edgeSnapshot[i + 1].length) - end;
+                    if (isGen) next.frameCount = next.length;
                 }
             }
             this._previewSegments = segs;
@@ -4254,19 +4767,29 @@ class BerniniDirectorEditor {
     }
 
     onMouseUp() {
-        if (this._drag?.kind === "edge" && this._previewSegments) {
+        if ((this._drag?.kind === "edge" || this._drag?.kind === "fl2v-move") && this._previewSegments) {
             this.timeline.segments = this._previewSegments;
             this._previewSegments = null;
+            if (this.isFl2vMode()) {
+                normalizeFl2vSegments(this);
+                updateFl2vDetailUI(this);
+                this.updateVideoNameLabel();
+            }
             this.commit();
         } else if (this._drag?.kind === "reorder") {
             const toRank = this._reorderDropRank;
             if (toRank >= 0 && toRank !== this._drag.fromRank) {
                 this.reorderSegmentsByRank(this._drag.fromRank, toRank);
                 this.commit(false, { syncTimeline: true });
+                if (this.isFl2vMode()) {
+                    updateFl2vDetailUI(this);
+                    this.updateVideoNameLabel();
+                }
             }
             this._reorderDropRank = -1;
             this._reorderFromRank = -1;
             this.canvas.classList.remove("bd-grabbing");
+            this.canvas.style.cursor = "";
         } else if (this._drag) {
             this.seekBar.value = this.currentFrame;
             this.scheduleRender();
@@ -4370,6 +4893,7 @@ class BerniniDirectorEditor {
 
     /** Interior segment boundaries that can be selected/deleted (not clip seams). */
     getEditableSplitFrames() {
+        if (this.isFl2vMode() || this.isGenMode() || this.isImageBatch()) return [];
         const total = this.getTotalFrames();
         if (total < MIN_SEG * 2) return [];
         const forced = new Set([0, total, ...this.getClipBoundaries()]);
@@ -4569,6 +5093,25 @@ class BerniniDirectorEditor {
             this.genDeleteSelectedSegment();
             return;
         }
+        if (this.isFl2vMode()) {
+            const idx = this.selectedIndex;
+            const segs = this.timeline.segments || [];
+            if (!segs[idx]) return;
+            segs.splice(idx, 1);
+            normalizeFl2vSegments(this);
+            this.selectedIndex = clamp(idx, 0, Math.max(0, (this.timeline.segments?.length || 1) - 1));
+            if (!this.timeline.segments?.length) this.selectedIndex = 0;
+            this.currentFrame = clamp(this.currentFrame, 0, Math.max(0, this.getTotalFrames() - 1));
+            if (this.seekBar) {
+                this.seekBar.max = Math.max(0, this.getTotalFrames() - 1);
+                this.seekBar.value = this.currentFrame;
+            }
+            this.commit(false, { syncTimeline: true });
+            updateFl2vDetailUI(this);
+            this.updateVideoNameLabel();
+            this.updateDomWidgetHeight();
+            return;
+        }
         const idx = this.selectedIndex;
         const seg = this.timeline.segments[idx];
         if (!seg) return;
@@ -4686,6 +5229,10 @@ class BerniniDirectorEditor {
     }
 
     drawSegmentThumbnails(ctx, seg, startX, pxWidth, y0, h) {
+        if (this.isFl2vMode()) {
+            drawFl2vSegmentThumbnails(this, ctx, seg, startX, pxWidth, y0, h);
+            return;
+        }
         ctx.save();
         ctx.beginPath();
         ctx.rect(startX, y0 + 1, pxWidth, h - 2);
@@ -4756,7 +5303,11 @@ class BerniniDirectorEditor {
             ctx.font = "12px sans-serif";
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
-            ctx.fillText("点击「上传视频」", startX + pxWidth / 2, y0 + h / 2);
+            ctx.fillText(
+                this.isFl2vMode() ? "点击「上传图片」" : "点击「上传视频」",
+                startX + pxWidth / 2,
+                y0 + h / 2,
+            );
             ctx.restore();
             return;
         }
@@ -4799,6 +5350,67 @@ class BerniniDirectorEditor {
             ctx.textBaseline = "alphabetic";
             ctx.fillText("✓", x + 2, y + 11);
         }
+        ctx.restore();
+    }
+
+    _drawReorderInsertMarker(ix) {
+        const ctx = this.ctx;
+        const y0 = TRACK_Y;
+        const y1 = TRACK_Y + TRACK_H;
+        ctx.save();
+        ctx.strokeStyle = "#4fff8f";
+        ctx.fillStyle = "#4fff8f";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(ix, y0);
+        ctx.lineTo(ix, y1);
+        ctx.stroke();
+        // Triangles at top/bottom
+        const t = 7;
+        ctx.beginPath();
+        ctx.moveTo(ix, y0);
+        ctx.lineTo(ix - t, y0 - t);
+        ctx.lineTo(ix + t, y0 - t);
+        ctx.closePath();
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(ix, y1);
+        ctx.lineTo(ix - t, y1 + t);
+        ctx.lineTo(ix + t, y1 + t);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+    }
+
+    /** Floating ghost card that follows the pointer while reordering clips. */
+    _drawReorderGhost(width, segs, fromRank) {
+        if (fromRank < 0 || this._drag?.pointerX == null) return;
+        const ordered = this._orderedSegmentsWithRank();
+        const item = ordered.find((o) => o.visualRank === fromRank);
+        if (!item?.seg) return;
+        const seg = item.seg;
+        const srcW = Math.max(48, this.frameToX(seg.start + seg.length, width) - this.frameToX(seg.start, width));
+        const gw = Math.min(140, Math.max(72, srcW * 0.55));
+        const gh = TRACK_H * 0.78;
+        const gx = this._drag.pointerX - gw / 2;
+        const gy = clamp(this._drag.pointerY - gh / 2, TRACK_Y - 8, TRACK_Y + TRACK_H - gh + 8);
+        const ctx = this.ctx;
+        ctx.save();
+        // Drop shadow
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(gx + 4, gy + 5, gw, gh);
+        ctx.globalAlpha = 0.95;
+        this.drawSegmentThumbnails(ctx, seg, gx, gw, gy, gh);
+        ctx.strokeStyle = "#4fff8f";
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+        ctx.fillStyle = "rgba(20,40,28,0.9)";
+        ctx.fillRect(gx + 4, gy + 4, 44, 16);
+        ctx.fillStyle = "#4fff8f";
+        ctx.font = "bold 10px sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText("拖动中", gx + 8, gy + 12);
         ctx.restore();
     }
 
@@ -4858,12 +5470,16 @@ class BerniniDirectorEditor {
         const dpr = window.devicePixelRatio || 1;
         const bw = Math.round(width * dpr);
         const bh = Math.round(height * dpr);
+        // Keep bitmap ↔ CSS aspect in lockstep. During run, flex layout can
+        // squash the canvas box; mismatched CSS height makes thumbs look stretched.
         if (this.canvas.width !== bw || this.canvas.height !== bh) {
             this.canvas.width = bw;
             this.canvas.height = bh;
-            this.canvas.style.height = `${height}px`;
-            this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         }
+        this.canvas.style.height = `${height}px`;
+        this.canvas.style.maxHeight = `${height}px`;
+        this.canvas.style.minHeight = `${height}px`;
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         this.ctx.clearRect(0, 0, width, height);
 
         const total = this.getTotalFrames();
@@ -4920,6 +5536,14 @@ class BerniniDirectorEditor {
         this.ctx.fillStyle = "#111";
         this.ctx.fillRect(0, TRACK_Y, width, TRACK_H);
 
+        if (!segs.length && this.isFl2vMode()) {
+            this.ctx.fillStyle = "#666";
+            this.ctx.font = "12px sans-serif";
+            this.ctx.textAlign = "center";
+            this.ctx.textBaseline = "middle";
+            this.ctx.fillText("点击「上传图片」", width / 2, TRACK_Y + TRACK_H / 2);
+        }
+
         const clipBounds = this.getClipBoundaries();
         if (clipBounds.length) {
             this.ctx.strokeStyle = "rgba(102,170,255,0.55)";
@@ -4937,6 +5561,7 @@ class BerniniDirectorEditor {
 
         const reordering = this._drag?.kind === "reorder";
         const dragFromRank = reordering ? this._drag.fromRank : -1;
+        const dropRank = reordering ? this._reorderDropRank : -1;
 
         for (let i = 0; i < segs.length; i++) {
             const seg = segs[i];
@@ -4946,38 +5571,74 @@ class BerniniDirectorEditor {
             const sel = i === this.selectedIndex;
             const running = i === this._runHighlightSeg;
             const runOn = this.isSegmentRunEnabled(i);
-            if (this.isRunSelectEnabled() && segs.length >= 2 && !runOn) {
+            const fl2vStart = !this.isFl2vMode() || !!seg.isStartFrame;
+            const visualRank = this._visualRankFromArrayIndex(i);
+            const isDragSource = reordering && visualRank === dragFromRank;
+            const isDropTarget = reordering && dropRank >= 0 && visualRank === dropRank && dropRank !== dragFromRank;
+            if (this.isRunSelectEnabled() && this.getRunnableSegmentCount() >= 2 && fl2vStart && !runOn) {
                 this.ctx.globalAlpha = 0.32;
-            } else if (reordering && this._visualRankFromArrayIndex(i) === dragFromRank) {
-                this.ctx.globalAlpha = 0.38;
+            } else if (isDragSource) {
+                this.ctx.globalAlpha = 0.28;
+            } else if (reordering && !isDropTarget) {
+                this.ctx.globalAlpha = 0.55;
+            } else if (this.isFl2vMode() && !seg.isStartFrame) {
+                this.ctx.globalAlpha = 0.72;
             }
             this.drawSegmentThumbnails(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
-            this.drawPromptOverlay(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
+            if (!this.isFl2vMode() || seg.isStartFrame) {
+                this.drawPromptOverlay(this.ctx, seg, x0, pxW, TRACK_Y, TRACK_H);
+            }
             const clipIdx = this.getSegmentClipIndex(seg);
             const clipColor = CLIP_SEGMENT_COLORS[clipIdx % CLIP_SEGMENT_COLORS.length];
-            this.ctx.strokeStyle = running ? "#4fff8f" : sel ? "#fff" : clipColor;
-            this.ctx.lineWidth = running ? 3 : sel ? 2.5 : 1.5;
-            this.ctx.strokeRect(x0 + 0.5, TRACK_Y + 0.5, pxW - 1, TRACK_H - 1);
-            this.ctx.fillStyle = "#ffcc00";
-            this.ctx.fillRect(x0 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
-            this.ctx.fillRect(x1 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
+            if (isDropTarget) {
+                this.ctx.fillStyle = "rgba(79,255,143,0.14)";
+                this.ctx.fillRect(x0, TRACK_Y, pxW, TRACK_H);
+                this.ctx.strokeStyle = "#4fff8f";
+                this.ctx.lineWidth = 3;
+                this.ctx.setLineDash([7, 4]);
+                this.ctx.strokeRect(x0 + 1, TRACK_Y + 1, pxW - 2, TRACK_H - 2);
+                this.ctx.setLineDash([]);
+                this.ctx.fillStyle = "rgba(20,40,28,0.92)";
+                const label = this.isFl2vMode() ? "交换到此处" : "插入到此处";
+                this.ctx.font = "bold 11px sans-serif";
+                const tw = this.ctx.measureText(label).width + 12;
+                this.ctx.fillRect(x0 + (pxW - tw) / 2, TRACK_Y + 8, tw, 18);
+                this.ctx.fillStyle = "#4fff8f";
+                this.ctx.textAlign = "center";
+                this.ctx.textBaseline = "middle";
+                this.ctx.fillText(label, x0 + pxW / 2, TRACK_Y + 17);
+            } else {
+                this.ctx.strokeStyle = running ? "#4fff8f" : sel ? "#fff" : clipColor;
+                this.ctx.lineWidth = running ? 3 : sel ? 2.5 : 1.5;
+                this.ctx.strokeRect(x0 + 0.5, TRACK_Y + 0.5, pxW - 1, TRACK_H - 1);
+            }
+            if (this.isFl2vMode()) {
+                this._drawFl2vEdgeHandles(segs, i, x0, x1, width);
+            } else {
+                this.ctx.fillStyle = "#ffcc00";
+                this.ctx.fillRect(x0 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
+                this.ctx.fillRect(x1 - 2, TRACK_Y + TRACK_H / 2 - 12, 4, 24);
+            }
             this.ctx.globalAlpha = 1;
             // Checkbox on top-left; drawn last so it stays clear on dimmed segments.
-            if (this.isRunSelectEnabled() && segs.length >= 2 && pxW >= RUN_CHECK_SIZE + 8) {
+            if (
+                this.isRunSelectEnabled()
+                && this.getRunnableSegmentCount() >= 2
+                && pxW >= RUN_CHECK_SIZE + 8
+                && (!this.isFl2vMode() || seg.isStartFrame)
+            ) {
                 const g = this._runCheckGeometry(seg, width);
                 this._drawSegmentRunCheck(g.boxX, g.boxY, runOn);
             }
         }
 
-        if (reordering && this._reorderDropRank >= 0) {
-            const insertFrame = this._getReorderInsertFrame(this._reorderDropRank, dragFromRank);
-            const ix = this.frameToX(insertFrame, width);
-            this.ctx.strokeStyle = "#4fff8f";
-            this.ctx.lineWidth = 3;
-            this.ctx.beginPath();
-            this.ctx.moveTo(ix, TRACK_Y);
-            this.ctx.lineTo(ix, TRACK_Y + TRACK_H);
-            this.ctx.stroke();
+        if (reordering) {
+            this._drawReorderGhost(width, segs, dragFromRank);
+            if (dropRank >= 0 && dropRank !== dragFromRank && !this.isFl2vMode()) {
+                const insertFrame = this._getReorderInsertFrame(dropRank, dragFromRank);
+                const ix = this.frameToX(insertFrame, width);
+                this._drawReorderInsertMarker(ix);
+            }
         }
 
         // Editable split-point markers: click = select only; delete via toolbar button.
@@ -5119,6 +5780,7 @@ class BerniniDirectorEditor {
         if (this.globalTask) this.globalTask.value = this.timeline.global.taskType || "";
         if (this.globalPrompt) this.globalPrompt.value = this.timeline.global.prompt || "";
         this.syncNegativeFromWidget();
+        updateFl2vReplaceBtn(this);
 
         const hideTimeline = this.isImageBatch() || this.isGenMode();
         const seg = this.isGlobalMode() ? null : this.timeline.segments[this.selectedIndex];
@@ -5182,6 +5844,7 @@ class BerniniDirectorEditor {
             const fc = seg.frameCount ?? seg.length ?? defaultFrameCount(this.getTaskKey());
             if (this.genSegFc) this.genSegFc.value = fc;
         }
+        if (this.isFl2vMode()) updateFl2vDetailUI(this);
     }
 
     renderRefSlots(refs, box, isGlobal) {
@@ -5465,6 +6128,9 @@ class BerniniDirectorEditor {
         this.runDetailEl.textContent = parts.join(" · ");
         this.runOverallEl.style.width = `${overallPct}%`;
         this.runPhaseEl.style.width = `${phasePct}%`;
+        // Progress text can grow the status bar — resize host so the timeline
+        // canvas is not flex-squashed (fl2v repeat thumbs look stretched).
+        syncDirectorNodeSize(this.node, this);
         if (this.isImageBatch()) this.renderImageBatchGroups();
         else this.scheduleRender();
     }

@@ -13,9 +13,10 @@ log = logging.getLogger("ComfyUI-Bernini-Director.director.gen")
 
 GEN_BLANK_KEYS = frozenset({"t2i", "t2v", "r2i", "r2v"})
 GEN_IMAGE_KEYS = frozenset({"i2i", "i2v"})
-GEN_TASK_KEYS = GEN_BLANK_KEYS | GEN_IMAGE_KEYS
+FL2V_KEYS = frozenset({"fl2v"})
+GEN_TASK_KEYS = GEN_BLANK_KEYS | GEN_IMAGE_KEYS | FL2V_KEYS
 PROMPT_BATCH_KEYS = frozenset({"t2i", "i2i", "r2i", "t2v", "i2v", "r2v"})
-VIDEO_BATCH_KEYS = frozenset({"t2v", "i2v", "r2v"})
+VIDEO_BATCH_KEYS = frozenset({"t2v", "i2v", "r2v", "fl2v"})
 IMAGE_BATCH_KEYS = frozenset({"t2i", "i2i", "r2i"})  # legacy alias
 
 MIN_GEN_FRAMES = 1
@@ -28,7 +29,7 @@ def is_gen_task_key(task_key: str) -> bool:
 
 def is_gen_timeline(timeline: dict, task_key: str) -> bool:
     mode = str(timeline.get("timelineMode") or "").lower()
-    if mode in ("gen_blank", "gen_image", "image_batch", "prompt_batch"):
+    if mode in ("gen_blank", "gen_image", "image_batch", "prompt_batch", "fl2v"):
         return True
     if mode == "video":
         return False
@@ -38,6 +39,9 @@ def is_gen_timeline(timeline: dict, task_key: str) -> bool:
 def is_prompt_batch_timeline(timeline: dict, task_key: str) -> bool:
     mode = str(timeline.get("timelineMode") or "").lower()
     if mode in ("image_batch", "prompt_batch"):
+        return True
+    # fl2v is a separate strip UI but still exports like a video prompt-batch.
+    if mode == "fl2v" or task_key == "fl2v":
         return True
     return task_key in PROMPT_BATCH_KEYS
 

@@ -15,11 +15,12 @@
 | 功能 | 说明 |
 |------|------|
 | **多段时间轴** | 节点内上传视频，支持切分、均分、智能分镜分割、追加；分割点可选中删除；可视化时间轴预览每段范围 |
-| **多任务模式** | 完整 `task_type`：`default`（默认通用）、`t2i`（文生图）、`t2v`（文生视频）、`i2i`（图生图）、`r2i`（参考主体生图）、`i2v`（图生视频，实验性）、`v2v`（视频转视频）、`r2v`（参考主体生视频）、`vi2v`（内容延展改视频）、`rv2v`（参考素材改视频）、`ads2v`（广告植入视频）、`vrc2v`（主体位置动作微调）、`mv2v`（全参数精细化改视频） |
+| **多任务模式** | 完整 `task_type`：`default`（默认通用）、`t2i`（文生图）、`t2v`（文生视频）、`i2i`（图生图）、`r2i`（参考主体生图）、`i2v`（图生视频，实验性）、`fl2v`（首尾帧生视频）、`v2v`（视频转视频）、`r2v`（参考主体生视频）、`vi2v`（内容延展改视频）、`rv2v`（参考素材改视频）、`ads2v`（广告植入视频）、`vrc2v`（主体位置动作微调）、`mv2v`（全参数精细化改视频） |
+| **首尾帧 (fl2v)** | 独立首尾帧时间轴：多关键帧排布、勾选「首帧 / 尾帧」、拖缘调时长；`image0`/`image1` 为硬锁定首尾画面（非软参考）；每镜可写正向 / 反向提示词（正向写中间运动）；支持仅首帧（同 i2v 锁定）或首+尾帧成片 |
 | **参考图引导** | 最多 5 张参考图（image0–image4），支持 `@imageN` 提示词引用 |
 | **双阶段采样** | HIGH / LOW 双 UNET，独立 CFG、seed、步数与 split |
-| **段间引导** | 默认关闭=官方 Studio 单段逻辑；勾选后才走跨段注入分支 |
-| **LLM 提示词增强** | 内置 Ollama / 智谱等接口，按 Bernini 官方模板扩写提示词 |
+| **段间引导** | 默认关闭=官方 Studio 单段逻辑；勾选后才走跨段注入分支（用于 v2v/rv2v 等视频多段；**不适用于** fl2v） |
+| **LLM 提示词增强** | 内置 Ollama / 智谱等接口，按 Bernini 官方模板扩写提示词（fl2v 有专用模板，只扩写中间过程） |
 | **音频导出** | 源视频含音轨时可从 `audio` 口输出，直连 VHS 合成 |
 | **运行报告** | `report` 口输出分段计划、连贯设置、每段任务摘要 |
 
@@ -86,6 +87,15 @@ pip install -r ComfyUI_Bernini_Director/requirements.txt
 2. 从 [文章 489](https://comfyit.cn/article/489) 或本仓库 `example_workflows/` 加载示例
 3. 连接 VAE / UNET×2 / CLIP，在导演台节点 UI 内上传源视频 / 参考图，编辑提示词后 Queue
 
+**视频教程：** [B 站合集 · 插件使用教程](https://space.bilibili.com/1997403556/lists/8357740)
+
+### 首尾帧 fl2v 用法摘要
+
+1. 任务类型选 **「首尾帧生视频 (fl2v)」**，进入首尾帧时间轴（无需源视频）
+2. 上传一张或多张关键帧；将镜头起点勾为 **首帧**，终点勾为 **尾帧**（可只勾首帧，则按锁定首帧生成）
+3. 用总帧数与片段左右缘调整每镜时长；正向提示词写**中间运动 / 镜头 / 过渡**，反向提示词默认 `bad video`（可改）；系统会自动注入「完全保持首尾帧」与 `image0`/`image1` 硬锁定
+4. Queue 生成；多镜可勾选「选择运行」只跑部分首帧镜头
+
 ## 配套生态 · [Comfyit 搅拌站](https://comfyit.cn/)
 
 [Comfyit](https://comfyit.cn/) 提供环境、模型、工作流与教程配套：
@@ -93,6 +103,7 @@ pip install -r ComfyUI_Bernini_Director/requirements.txt
 | 栏目 | 链接 |
 |------|------|
 | 模型 / 工作流包 | [comfyit.cn/article/489](https://comfyit.cn/article/489) |
+| 插件视频教程 | [B 站合集](https://space.bilibili.com/1997403556/lists/8357740) |
 | 产品中心 | [comfyit.cn/products](https://comfyit.cn/products) |
 | 插件广场 | [comfyit.cn/plugins](https://comfyit.cn/plugins) |
 | 模型广场 | [comfyit.cn/resources/models](https://comfyit.cn/resources/models) |
@@ -106,6 +117,7 @@ pip install -r ComfyUI_Bernini_Director/requirements.txt
 | **本仓库** | [github.com/AIMixer/ComfyUI_Bernini_Director](https://github.com/AIMixer/ComfyUI_Bernini_Director) |
 | **作者 QQ** | **3697688140** |
 | **B 站** | [space.bilibili.com/1997403556](https://space.bilibili.com/1997403556) |
+| **插件教程** | [B 站合集 · 使用教程](https://space.bilibili.com/1997403556/lists/8357740) |
 | **QQ 交流群** | **551482703** · **425064221** · **559826331** |
 | **Comfyit 搅拌站** | [comfyit.cn](https://comfyit.cn/) |
 

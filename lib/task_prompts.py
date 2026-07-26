@@ -51,6 +51,12 @@ TASK_PROMPT_SPECS: tuple[TaskPromptSpec, ...] = (
         "【实验性功能】Bernini 官方未提供 i2v 专用示例；源图作为单帧视频作为上下文生成视频。",
     ),
     TaskPromptSpec(
+        "fl2v",
+        "首尾帧生视频(First-Last Frame)",
+        "You are a helpful assistant specialized in image-to-video generation.",
+        "多关键帧时间轴：首帧采样、尾帧作固定终点；提示词强制「完全保持首尾帧」+ image0/image1 锁定（非参考图）。系统提示词同 i2v。",
+    ),
+    TaskPromptSpec(
         "v2v",
         "视频转视频(Video to Video)",
         "You are a helpful assistant specialized in video editing.",
