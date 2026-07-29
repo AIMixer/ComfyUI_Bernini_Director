@@ -11,6 +11,9 @@ selection as ``load_video_resampled``, with PCM-safe clocks:
   4. take exactly ``count / timeline_fps`` of audio (IMAGE / Combine clock).
      Pad/trim only — never stretch PTS media into a shorter timeline window
      (that reads as “加速放完”).
+  5. Join spans on consecutive *source* frames (not native decode indices) so
+     timeline fps remapping does not shatter PCM into per-frame clicks; apply a
+     short edge fade only at real multi-clip / gap boundaries.
 
 If a PTS-based seek lands past the decoded PCM (common after deleting leading
 timeline segments when fps/PTS disagree), fall back to ``native / file_fps``
@@ -132,6 +135,22 @@ def frames_to_audio_samples(frame_count: int, fps: float, sample_rate: int) -> i
     return int(round(frame_count * sample_rate / fps))
 
 
+def _median_positive_pts_delta(times: list[float]) -> float:
+    ordered = sorted(set(float(value) for value in times))
+    deltas = [
+        right - left
+        for left, right in zip(ordered, ordered[1:])
+        if right - left > 1e-9
+    ]
+    if not deltas:
+        return 0.0
+    deltas.sort()
+    middle = len(deltas) // 2
+    if len(deltas) % 2:
+        return float(deltas[middle])
+    return float((deltas[middle - 1] + deltas[middle]) / 2.0)
+
+
 def _clip_probe_fps(clip: dict, timeline_fps: float) -> float:
     file_fps = float(clip.get("nativeFps") or clip.get("native_fps") or 0.0)
     if file_fps <= 0:
@@ -234,7 +253,7 @@ def _probe_av_timing(path: str, *, fallback_fps: float) -> tuple[float, float, f
                     "-select_streams",
                     "v:0",
                     "-read_intervals",
-                    "%+#2",
+                    "%+#64",
                     "-show_entries",
                     "frame=pts_time",
                     "-of",
@@ -253,12 +272,29 @@ def _probe_av_timing(path: str, *, fallback_fps: float) -> tuple[float, float, f
                     times.append(float(val))
                 except ValueError:
                     continue
-                if len(times) >= 2:
+                if len(times) >= 64:
                     break
             if times:
-                video_pts0 = float(times[0])
-            if len(times) >= 2 and times[1] > times[0]:
-                frame_dur = float(times[1] - times[0])
+                video_pts0 = float(min(times))
+            measured_frame_dur = _median_positive_pts_delta(times)
+            if measured_frame_dur > 0:
+                nominal_frame_dur = float(frame_dur)
+                ratio = (
+                    measured_frame_dur / nominal_frame_dur
+                    if nominal_frame_dur > 0
+                    else 1.0
+                )
+                if nominal_frame_dur <= 0 or 0.5 <= ratio <= 2.0:
+                    frame_dur = measured_frame_dur
+                else:
+                    log.warning(
+                        "Ignoring implausible source PTS frame tick for %s: "
+                        "measured=%.6fs, stream/fallback=%.6fs (ratio=%.3f)",
+                        os.path.basename(path),
+                        measured_frame_dur,
+                        nominal_frame_dur,
+                        ratio,
+                    )
         except (subprocess.CalledProcessError, OSError, ValueError):
             pass
 
@@ -400,7 +436,13 @@ def _timeline_audio_spans(
     logical_end: int,
     frame_rate: float,
 ) -> list[tuple[str, float, float, int, float]]:
-    """Spans: (path, pcm_start_sec, out_dur, native0, file_fps)."""
+    """Spans: (path, pcm_start_sec, out_dur, native0, file_fps).
+
+    Contiguity follows consecutive *source* frames on the timeline (not native
+    decode indices). After fps remapping, native often skips/duplicates; requiring
+    ``native == run_n0 + run_count`` splinters audio into per-frame chunks and
+    causes seam clicks when concatenating.
+    """
     if logical_end <= logical_start or frame_rate <= 0:
         return []
     clips = video_clips_from_timeline(timeline)
@@ -410,15 +452,18 @@ def _timeline_audio_spans(
     fps = float(frame_rate)
     spans: list[tuple[str, float, float, int, float]] = []
     run_path: str | None = None
+    run_clip_idx = -1
     run_file_fps = fps
     run_n0 = 0
+    run_last_src_frame = -1
     run_count = 0
     run_video_pts0 = 0.0
     run_audio_start = 0.0
     run_frame_dur = 1.0 / fps
 
     def flush_run() -> None:
-        nonlocal run_path, run_file_fps, run_n0, run_count
+        nonlocal run_path, run_clip_idx, run_file_fps, run_n0
+        nonlocal run_last_src_frame, run_count
         nonlocal run_video_pts0, run_audio_start, run_frame_dur
         if run_path and run_count > 0:
             pcm_start = _pcm_time_for_native(
@@ -433,6 +478,8 @@ def _timeline_audio_spans(
                     (run_path, pcm_start, out_dur, int(run_n0), float(run_file_fps))
                 )
         run_path = None
+        run_clip_idx = -1
+        run_last_src_frame = -1
         run_count = 0
 
     for logical in range(logical_start, logical_end):
@@ -453,25 +500,60 @@ def _timeline_audio_spans(
         )
         if (
             run_path == path
+            and run_clip_idx == clip_idx
             and run_count > 0
             and abs(run_file_fps - file_fps) < 1e-6
             and abs(run_frame_dur - frame_dur) < 1e-9
             and abs(run_video_pts0 - video_pts0) < 1e-9
             and abs(run_audio_start - audio_start) < 1e-9
-            and native == run_n0 + run_count
+            and src_frame == run_last_src_frame + 1
         ):
             run_count += 1
+            run_last_src_frame = src_frame
             continue
         flush_run()
         run_path = path
+        run_clip_idx = clip_idx
         run_file_fps = file_fps
         run_n0 = native
+        run_last_src_frame = src_frame
         run_count = 1
         run_video_pts0 = video_pts0
         run_audio_start = audio_start
         run_frame_dur = frame_dur
     flush_run()
     return spans
+
+
+def _fade_audio_chunk_boundaries(
+    chunks: list[torch.Tensor], sample_rate: int, fade_ms: float = 3.0
+) -> list[torch.Tensor]:
+    """Light edge fades between real timeline joins (multi-clip / deleted ranges)."""
+    if len(chunks) < 2 or sample_rate <= 0 or fade_ms <= 0:
+        return chunks
+    faded = [chunk.clone() for chunk in chunks]
+    requested = max(1, int(round(float(sample_rate) * float(fade_ms) / 1000.0)))
+    for previous, following in zip(faded, faded[1:]):
+        count = min(requested, int(previous.shape[-1]), int(following.shape[-1]))
+        if count <= 1:
+            continue
+        fade_out = torch.linspace(
+            1.0,
+            0.0,
+            count,
+            dtype=previous.dtype,
+            device=previous.device,
+        )
+        fade_in = torch.linspace(
+            0.0,
+            1.0,
+            count,
+            dtype=following.dtype,
+            device=following.device,
+        )
+        previous[..., -count:] *= fade_out
+        following[..., :count] *= fade_in
+    return faded
 
 
 def extract_timeline_audio(
@@ -534,6 +616,12 @@ def extract_timeline_audio(
 
     if not chunks:
         return None
+    if len(chunks) > 1:
+        chunks = _fade_audio_chunk_boundaries(chunks, sr)
+        log.info(
+            "Source audio: applied 3 ms edge fades at %d real timeline boundary(s).",
+            len(chunks) - 1,
+        )
     merged = torch.cat(chunks, dim=-1)
     fps = float(frame_rate or 24.0)
     n_frames = max(0, int(logical_end) - int(logical_start))
