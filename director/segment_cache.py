@@ -56,6 +56,8 @@ def segment_cache_fingerprint(seg: SegmentPlan, plan: DirectorPlan) -> dict[str,
         "ref_video_start": seg.reference_video_start_frame,
         "continuity": plan.continuity_enabled,
         "continuity_overlap": plan.continuity_overlap_frames if plan.continuity_enabled else 0,
+        # Bump when continuity sampling/handoff semantics change (invalidates stale segs).
+        "continuity_pipeline": "scail_settling12_clean_v18",
     }
 
 

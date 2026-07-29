@@ -22,8 +22,10 @@ def _carry_scail_lock_into_low_stage(
     the locked prev-tail was freely rewritten — continuity looked identical to OFF.
     Official SCAIL-style two-phase samplers keep an anchor mask in phase 2 as well.
 
-    Also re-bake mask==0 regions from the pre-high locked latent so any high-stage
-    leakage cannot drift the handoff into low.
+    Also re-bake locked regions (mask < 0.5) from the pre-high locked latent so
+    any high-stage leakage cannot drift the handoff into low. With hard locks
+    (feather=0) this is mask==0 only; partial feather was disabled because it
+    under-denoised continuity bodies (画面花).
     """
     if not isinstance(latent_high, dict) or not isinstance(latent_locked, dict):
         return latent_high

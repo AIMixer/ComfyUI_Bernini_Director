@@ -42,6 +42,8 @@ from .segment_continuity import (
     is_continuity_lead_segment,
     match_clip_to_gen_length,
     prepend_continuity_source,
+    resolve_continuity_lock_pixels,
+    resolve_continuity_settling_frames,
     resolve_prev_segment_output,
     resolve_segment_generation_frames,
     trim_decoded_for_continuity,
@@ -101,8 +103,8 @@ def execute_director_plan_core(
     completed_outputs: dict[int, torch.Tensor] = {}
     if plan.continuity_enabled:
         reports.append(
-            "Segment continuity: ON — SCAIL prefix lock (both sample stages) + "
-            "source prepend + luma-matched guide (no leading seam skip)"
+            "Segment continuity: ON — SCAIL lock + settling 12f burn-in + mild "
+            "body bridge + additive luma only (no concat RGB morph)"
         )
     else:
         reports.append(
@@ -175,6 +177,7 @@ def execute_director_plan_core(
             clip_frames = fit_video_long_edge(body_raw, plan.ref_max_size)
         # Length prep: official Studio = this segment only; continuity prepends prev-tail.
         prev_tail_output = None
+        source_luma_ref = None
         if fl2v_endpoint_source:
             num_frames = int(clip_frames.shape[0])
             prefix_trim = 0
@@ -207,10 +210,19 @@ def execute_director_plan_core(
                         else:
                             extra = fit_video_long_edge(extra, plan.ref_max_size)
                         clip_frames = torch.cat([clip_frames, extra], dim=0)
+                    # Capture body[0] before prepend — same ref used to luma-match SCAIL.
+                    if clip_frames is not None and int(clip_frames.shape[0]) > 0:
+                        source_luma_ref = clip_frames[0]
+                    # lock_px is SCAIL-only; settling is burn-in discarded with lock on trim.
+                    lock_px = resolve_continuity_lock_pixels(
+                        plan.continuity_overlap_frames
+                    )
+                    settling = resolve_continuity_settling_frames()
                     clip_frames = prepend_continuity_source(
                         clip_frames,
                         prev_tail_output,
-                        lock_px=prefix_trim,
+                        lock_px=lock_px,
+                        settling_frames=settling,
                         width=ctx_w,
                         height=ctx_h,
                     )
@@ -366,6 +378,7 @@ def execute_director_plan_core(
                 height=ctx_h,
                 ref_max_size=plan.ref_max_size,
                 latent=latent,
+                source_luma_ref=source_luma_ref,
             )
             if continuity_note:
                 reports.append(continuity_note)
@@ -430,7 +443,7 @@ def execute_director_plan_core(
             **meta,
         )
 
-        # Length finalize only — no color/luma post (avoids smile drift / color shift).
+        # Length finalize — opening luma match + light last-frame nudge (no whole-clip color post).
         if seg_continuity:
             decoded = trim_decoded_for_continuity(
                 decoded,
