@@ -205,8 +205,37 @@ def _build_fl2v_endpoint_source(
     if end_img is not None:
         if end_img.ndim == 3:
             end_img = end_img.unsqueeze(0)
-        clip[-1] = end_img[0]
+        # long_edge fit never upscales: different source aspects → different H×W
+        # (e.g. start 848×640, end 688×512). Match end to the start canvas.
+        h, w = int(clip.shape[1]), int(clip.shape[2])
+        if int(end_img.shape[1]) != h or int(end_img.shape[2]) != w:
+            log.info(
+                "fl2v: fitting end frame %dx%d → %dx%d to match start canvas",
+                int(end_img.shape[2]),
+                int(end_img.shape[1]),
+                w,
+                h,
+            )
+            end_img = fit_canvas(end_img[:1], w, h)
+        clip[-1:] = end_img[:1].to(device=clip.device, dtype=clip.dtype)
     return clip
+
+
+def _unify_fl2v_pair_canvas(
+    start_img: torch.Tensor,
+    end_img: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Ensure image0/image1 share one HxW after independent long_edge fits."""
+    if start_img.ndim == 3:
+        start_img = start_img.unsqueeze(0)
+    if end_img is None:
+        return start_img, None
+    if end_img.ndim == 3:
+        end_img = end_img.unsqueeze(0)
+    h, w = int(start_img.shape[1]), int(start_img.shape[2])
+    if int(end_img.shape[1]) != h or int(end_img.shape[2]) != w:
+        end_img = fit_canvas(end_img[:1], w, h)
+    return start_img, end_img
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -454,9 +483,6 @@ def build_fl2v_director_plan(
             ref_max_size=ref_max,
         )
 
-        refs: list[SegmentRef] = [
-            SegmentRef(index=0, tensor=start_img[:1].clone()),
-        ]
         end_img = None
         if end_kf is not None:
             end_ref = {
@@ -470,6 +496,11 @@ def build_fl2v_director_plan(
                 output_mode=out_mode,
                 ref_max_size=ref_max,
             )
+        start_img, end_img = _unify_fl2v_pair_canvas(start_img, end_img)
+        refs: list[SegmentRef] = [
+            SegmentRef(index=0, tensor=start_img[:1].clone()),
+        ]
+        if end_img is not None:
             refs.append(SegmentRef(index=1, tensor=end_img[:1].clone()))
 
         # Endpoint source (first=image0, last=image1) — stronger than prompt/refs alone.
